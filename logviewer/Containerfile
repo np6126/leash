@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir pyyaml
+
+WORKDIR /app
+COPY server.py logo.svg ./
+COPY static/ static/
+COPY templates/ templates/
+
+EXPOSE 8090
+
+CMD ["python", "/app/server.py"]

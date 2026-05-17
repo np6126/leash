@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Copy this file to deploy-allowlist-local.sh (gitignored), then edit the
+# REMOTE default to your proxy host. Usage:
+#   ./deploy-allowlist-local.sh                  # uses REMOTE default
+#   ./deploy-allowlist-local.sh root@1.2.3.4     # override target
+set -euo pipefail
+
+REMOTE="${1:-root@<your-proxy-host>}"
+SRC="config/allowlist.local.yaml"
+DEST="/etc/leash/allowlist.local.yaml"
+
+scp "$SRC" "$REMOTE:$DEST"
+ssh "$REMOTE" "cd /root/leash && git pull && bash setup.sh"

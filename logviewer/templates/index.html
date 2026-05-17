@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>leash · audit log</title>
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <img src="/logo.svg" width="22" height="22" style="border-radius:5px;display:block" alt="leash">
+    leash <span class="logo-sub">/ audit log</span>
+  </div>
+  <div class="header-right">
+    <div class="stat">Log size: <strong id="log-size">—</strong></div>
+    <div class="divider"></div>
+    <div class="stat">Entries: <strong id="total-count">—</strong></div>
+    <div class="divider"></div>
+    <button class="btn" id="theme-btn" onclick="toggleTheme()" title="Toggle light/dark mode" style="padding:5px 9px">
+      <svg id="theme-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></svg>
+    </button>
+    <div class="divider"></div>
+    <button class="btn" id="redact-btn" onclick="toggleRedact()" title="Redact sensitive header values (API keys, cookies, …)" style="padding:5px 9px">
+      <svg id="redact-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></svg>
+    </button>
+    <div class="divider"></div>
+    <button class="btn" onclick="clearLogs()">
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+        <polyline points="3 6 4 14 12 14 13 6"/>
+        <line x1="1" y1="4" x2="15" y2="4"/>
+        <path d="M6 4V2h4v2"/>
+      </svg>
+      Clear logs
+    </button>
+  </div>
+</header>
+
+<div class="filters">
+  <div class="input-wrap">
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+      <circle cx="6.5" cy="6.5" r="4.5"/><line x1="10.5" y1="10.5" x2="14" y2="14"/>
+    </svg>
+    <input type="text" id="q" placeholder="Search URL, host, method, status…" oninput="onFilter()">
+  </div>
+  <div class="input-wrap">
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+      <rect x="2" y="2" width="12" height="12" rx="2"/>
+      <line x1="5" y1="8" x2="11" y2="8"/><line x1="5" y1="5" x2="11" y2="5"/><line x1="5" y1="11" x2="8" y2="11"/>
+    </svg>
+    <input type="text" id="client" placeholder="Filter by client IP" oninput="onFilter()">
+  </div>
+  <button class="toggle-btn" id="internet-toggle" onclick="toggleInternetOnly()" title="Versteckt Anfragen zu privaten IPs (RFC 1918)">
+    <span class="toggle-dot"></span>
+    Internet only
+  </button>
+  <span id="filter-spinner" class="filter-spinner" style="opacity:0"></span>
+  <span id="fetch-error" class="fetch-error" style="display:none" title="Log server unreachable — retrying…">⚠ disconnected</span>
+  <span class="filter-count" id="filter-count"></span>
+</div>
+
+<div class="table-outer">
+  <table>
+    <colgroup>
+      <col><col><col><col><col>
+    </colgroup>
+    <thead>
+      <tr>
+        <th data-sort="ts" onclick="sortBy('ts')">Time</th>
+        <th>Client</th>
+        <th>URL / Host</th>
+        <th data-sort="status" onclick="sortBy('status')">Status</th>
+        <th>Event</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div id="empty" class="empty" style="display:none">
+    <div class="empty-icon">◌</div>
+    No entries match your filter.
+  </div>
+</div>
+
+<div id="dialog-overlay" class="dialog-overlay" style="display:none" onclick="closeDialogIfBg(event)">
+  <div class="dialog-card" onclick="event.stopPropagation()">
+    <div class="dialog-header">
+      <span class="dialog-title">Manage Access</span>
+      <button class="dialog-close" onclick="closeDialog()" title="Close (Esc)">✕</button>
+    </div>
+    <div id="dialog-body" class="dialog-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

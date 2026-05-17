@@ -1,0 +1,29 @@
+[Unit]
+Description=leash log viewer
+After=network-online.target leash.service
+Wants=network-online.target leash.service
+
+[Container]
+Image=localhost/logviewer:latest
+ContainerName=logviewer
+Pull=newer
+RunInit=true
+
+PublishPort=0.0.0.0:8090:8090
+
+Volume=/var/lib/leash/logs:/logs:Z
+Volume=/etc/leash:/etc/leash:Z
+
+Environment=LOG_PATH=/logs/egress.jsonl
+Environment=ALLOWLIST_PATH=/etc/leash/allowlist.yaml
+Environment=PORT=8090
+Environment=BODY_LIMIT_KB=1024
+
+PodmanArgs=--memory 128m
+
+[Service]
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

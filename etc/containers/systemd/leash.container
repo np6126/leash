@@ -1,0 +1,29 @@
+[Unit]
+Description=leash — auditing egress proxy for tank-os AI agents
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/leash:latest
+ContainerName=leash
+Pull=newer
+RunInit=true
+
+PublishPort=0.0.0.0:8080:8080
+
+Volume=/var/lib/leash/mitmproxy:/root/.mitmproxy:Z
+Volume=/var/lib/leash/logs:/logs:Z
+Volume=/etc/leash:/etc/leash:Z
+
+Environment=ALLOWLIST_PATH=/etc/leash/allowlist.yaml
+Environment=LOG_PATH=/logs/egress.jsonl
+Environment=BODY_LIMIT_KB=1024
+
+PodmanArgs=--memory 256m
+
+[Service]
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

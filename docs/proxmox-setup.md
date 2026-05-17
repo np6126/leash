@@ -1,0 +1,161 @@
+# Proxmox VE Setup
+
+Steps to create the leash VM on a Proxmox host.
+
+## 1. Download the Ubuntu 24.04 Cloud Image
+
+Run on the Proxmox host:
+
+```bash
+wget -P /var/lib/vz/images/ \
+  https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+```
+
+## 2. Create the VM
+
+The leash VM needs two network interfaces:
+- `net0` on `vmbr0`: LAN access for SSH and outbound internet (NAT source)
+- `net1` on `vmbr1`: isolated agent network — leash acts as gateway at `10.10.10.1`
+
+```bash
+qm create <VMID> \
+  --name leash \
+  --memory 1024 \
+  --cores 1 \
+  --net0 virtio,bridge=vmbr0 \
+  --net1 virtio,bridge=vmbr1 \
+  --ostype l26
+
+qm importdisk <VMID> \
+  /var/lib/vz/images/noble-server-cloudimg-amd64.img \
+  local-lvm
+
+qm set <VMID> \
+  --scsihw virtio-scsi-pci \
+  --scsi0 local-lvm:vm-<VMID>-disk-0 \
+  --ide2 local-lvm:cloudinit \
+  --boot c --bootdisk scsi0 \
+  --serial0 socket --vga serial0 \
+  --agent enabled=1
+
+qm resize <VMID> scsi0 10G
+```
+
+## 3. Configure Cloud-Init
+
+Create a vendor cloud-init snippet to install the QEMU guest agent on first boot:
+
+```bash
+mkdir -p /var/lib/vz/snippets
+cat > /var/lib/vz/snippets/leash-vendor.yaml << 'EOF'
+#cloud-config
+packages:
+  - qemu-guest-agent
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+EOF
+```
+
+Then configure the VM. In the Proxmox UI, select the VM → **Cloud-Init** tab:
+
+| Field | Value |
+|---|---|
+| User | `root` (or your preferred username) |
+| SSH public key | paste your `~/.ssh/id_ed25519.pub` |
+| IP Config | static IP or DHCP depending on your network |
+| DNS domain / servers | as needed |
+
+Or via CLI:
+
+```bash
+qm set <VMID> \
+  --ciuser root \
+  --sshkeys ~/.ssh/id_ed25519.pub \
+  --ipconfig0 ip=<vm-ip>/24,gw=<your-gateway> \
+  --ipconfig1 ip=10.10.10.1/24 \
+  --nameserver 9.9.9.9
+qm set <VMID> --cicustom "vendor=local:snippets/leash-vendor.yaml"
+```
+
+`ipconfig1` has no gateway — leash is the gateway for that network, not a client of it.
+
+## 4. Start the VM
+
+```bash
+qm start <VMID>
+```
+
+## 5. Run the Setup Script
+
+SSH into the VM, then clone the repo and run the setup script:
+
+```bash
+ssh root@<vm-ip>
+git clone <gitrepo>/leash.git
+cd leash
+sudo ./setup.sh
+```
+
+**Private allowlist entries (optional):** If you need deployment-specific
+destinations that should not be committed to the repository, create
+`/etc/leash/allowlist.local.yaml` on the VM before running `setup.sh`:
+
+```bash
+sudo mkdir -p /etc/leash
+sudo tee /etc/leash/allowlist.local.yaml <<'EOF'
+allowed_destinations:
+  - host: registry.internal.example.com
+    ports: [443]
+EOF
+```
+
+`setup.sh` merges this file into the deployed allowlist automatically on every
+run. The file persists across `git pull && setup.sh` cycles and is never part
+of the repository.
+
+## 6. Extract the CA Certificate
+
+After setup, extract the mitmproxy CA certificate and distribute it to all agent VMs:
+
+```bash
+podman exec leash cat /root/.mitmproxy/mitmproxy-ca-cert.pem > mitmproxy-ca-cert.pem
+```
+
+With tank-claw-os, inject it as a Podman secret named `proxy_ca_cert`.
+
+## 7. Open the Log Viewer
+
+After setup, the audit log viewer is available at:
+
+```
+http://<vm-ip>:8090
+```
+
+It shows all proxy requests with timestamp, client, method, URL, port, status code, and response size — one row per request. Clicking a row expands the request/response headers and body. Features: free-text search, client IP filter, **Internet only** toggle (hides LAN/RFC 1918 traffic), dark/light mode, copy-to-clipboard on body blocks, and a **Clear logs** button. Use **Manage Access** in the detail panel to add or remove allowlist entries without editing YAML.
+
+## Firewall
+
+| Port | Purpose | Reachable from |
+|---|---|---|
+| 8080 | Proxy (agents connect here) | Agent VMs only (`10.10.10.0/24`) |
+| 8090 | Log viewer | Management network only — **never from `10.10.10.0/24`** |
+| 22 | SSH | Management network only |
+
+The log viewer's allowlist management endpoints (`/api/allowlist*`) are blocked
+at the application level for any client IP listed under `agent_networks` in
+`/etc/leash/allowlist.yaml`. The default config ships with `10.10.10.0/24`
+there, so agent VMs cannot modify their own restrictions out of the box.
+
+For additional hardening, also restrict port 8090 at the network level:
+
+```
+allow in  tcp dport 8080 from 10.10.10.0/24  # proxy — agents only
+allow in  tcp dport 8090 from <mgmt-network>  # log viewer — management only
+allow in  tcp dport 22   from <mgmt-network>  # SSH — management only
+drop      all
+```
+
+> **Why port 8090 must not be reachable from `10.10.10.0/24`:** An agent that
+> can reach the log viewer could call `/api/allowlist/add` to whitelist any
+> destination for itself. The `agent_networks` key in `allowlist.yaml` is the
+> primary control; a firewall rule is defence in depth.
