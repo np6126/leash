@@ -261,10 +261,10 @@ SSE (`text/event-stream`) responses are also streamed so that the proxy does
 not block the agent's real-time token feed.
 
 Text responses (JSON, plain text, XML, form data) up to `BODY_LIMIT_KB` KB
-(default 512 KB) are captured and stored in the log; larger text responses are
+(default 1024 KB) are captured and stored in the log; larger text responses are
 truncated. LLM API requests with large system prompts and tool definitions can
-easily exceed 64 KB, so the higher default ensures the full payload is captured
-in most cases.
+easily exceed 64 KB, so the default is set high enough to capture the full
+payload in most cases.
 
 ## Log Format
 

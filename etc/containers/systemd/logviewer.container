@@ -19,7 +19,7 @@ Environment=ALLOWLIST_PATH=/etc/leash/allowlist.yaml
 Environment=PORT=8090
 Environment=BODY_LIMIT_KB=1024
 
-PodmanArgs=--memory 128m
+PodmanArgs=--memory 512m
 
 [Service]
 Restart=always

@@ -66,7 +66,7 @@ class TestIsLan:
         assert srv._is_lan("mydevice.local")
 
     def test_dot_lan(self):
-        assert srv._is_lan("workstation.lan")
+        assert srv._is_lan("rainkingstation.lan")
 
     def test_dot_internal(self):
         assert srv._is_lan("service.internal")
@@ -87,7 +87,7 @@ class TestReadLogs:
             {"ts": 1.0, "event": "allowed", "host": "a.com", "client": "10.0.0.1"},
         ])
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        assert len(srv._read_logs("", "", 500)) == 1
+        assert len(list(srv._iter_logs("", "", 500))) == 1
 
     def test_connect_allowed_suppressed(self, tmp_path, monkeypatch):
         path = _write_log(tmp_path, [
@@ -95,7 +95,7 @@ class TestReadLogs:
             {"ts": 2.0, "event": "allowed",         "host": "a.com", "client": "10.0.0.1"},
         ])
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        result = srv._read_logs("", "", 500)
+        result = list(srv._iter_logs("", "", 500))
         assert len(result) == 1 and result[0]["event"] == "allowed"
 
     def test_newest_first(self, tmp_path, monkeypatch):
@@ -104,7 +104,7 @@ class TestReadLogs:
             {"ts": 2.0, "event": "allowed", "host": "b.com", "client": "10.0.0.1"},
         ])
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        result = srv._read_logs("", "", 500)
+        result = list(srv._iter_logs("", "", 500))
         assert result[0]["ts"] == 2.0 and result[1]["ts"] == 1.0
 
     def test_query_filter(self, tmp_path, monkeypatch):
@@ -113,7 +113,7 @@ class TestReadLogs:
             {"ts": 2.0, "event": "allowed", "host": "other.example.com",  "client": "10.0.0.1"},
         ])
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        result = srv._read_logs("target", "", 500)
+        result = list(srv._iter_logs("target", "", 500))
         assert len(result) == 1 and result[0]["host"] == "target.example.com"
 
     def test_client_filter(self, tmp_path, monkeypatch):
@@ -122,7 +122,7 @@ class TestReadLogs:
             {"ts": 2.0, "event": "allowed", "host": "a.com", "client": "10.0.0.2"},
         ])
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        result = srv._read_logs("", "10.0.0.1", 500)
+        result = list(srv._iter_logs("", "10.0.0.1", 500))
         assert len(result) == 1 and result[0]["client"] == "10.0.0.1"
 
     def test_internet_only_excludes_lan(self, tmp_path, monkeypatch):
@@ -131,7 +131,7 @@ class TestReadLogs:
             {"ts": 2.0, "event": "allowed", "host": "api.example.com", "client": "10.0.0.1"},
         ])
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        result = srv._read_logs("", "", 500, internet_only=True)
+        result = list(srv._iter_logs("", "", 500, internet_only=True))
         assert len(result) == 1 and result[0]["host"] == "api.example.com"
 
     def test_limit_respected(self, tmp_path, monkeypatch):
@@ -141,18 +141,18 @@ class TestReadLogs:
         ]
         path = _write_log(tmp_path, records)
         monkeypatch.setattr(srv, "LOG_PATH", path)
-        assert len(srv._read_logs("", "", 3)) == 3
+        assert len(list(srv._iter_logs("", "", 3))) == 3
 
     def test_malformed_lines_skipped(self, tmp_path, monkeypatch):
         p = tmp_path / "leash.jsonl"
         p.write_text('not json\n{"ts":1.0,"event":"allowed","host":"a.com","client":"10.0.0.1"}\n')
         monkeypatch.setattr(srv, "LOG_PATH", str(p))
-        result = srv._read_logs("", "", 500)
+        result = list(srv._iter_logs("", "", 500))
         assert len(result) == 1
 
     def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr(srv, "LOG_PATH", str(tmp_path / "nonexistent.jsonl"))
-        assert srv._read_logs("", "", 500) == []
+        assert list(srv._iter_logs("", "", 500)) == []
 
 
 # ── _load_allowlist / _save_allowlist ─────────────────────────────────────────

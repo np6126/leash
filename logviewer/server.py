@@ -93,7 +93,15 @@ class Handler(BaseHTTPRequestHandler):
             client_f = (qs.get("client", [""])[0] or "").strip().lower()
             limit = min(int(qs.get("limit", ["500"])[0]), 2000)
             internet_only = qs.get("internet_only", [""])[0] == "1"
-            self.send_json(200, _read_logs(q, client_f, limit, internet_only))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"[")
+            sep = b""
+            for record in _iter_logs(q, client_f, limit, internet_only):
+                self.wfile.write(sep + json.dumps(record).encode())
+                sep = b","
+            self.wfile.write(b"]")
 
         elif parsed.path == "/api/meta":
             try:
@@ -343,9 +351,11 @@ def _count_lines() -> int:
         with _count_lock:
             if mtime == _count_cache[0]:
                 return _count_cache[1]
+        count = 0
         with open(LOG_PATH, "rb") as f:
-            data = f.read()
-        count = sum(1 for ln in data.splitlines() if ln.strip() and _CONNECT_MARKER not in ln)
+            for ln in f:
+                if ln.strip() and _CONNECT_MARKER not in ln:
+                    count += 1
         with _count_lock:
             _count_cache = (mtime, count)
         return count
@@ -366,38 +376,40 @@ def _record_matches(record: dict, q: str, client_f: str, internet_only: bool) ->
     return True
 
 
-def _read_logs(q: str, client_f: str, limit: int, internet_only: bool = False) -> list:
+def _iter_logs(q: str, client_f: str, limit: int, internet_only: bool = False):
     # The proxy addon appends to this file concurrently. POSIX append semantics
     # prevent torn writes, but a line being written exactly as the mmap is built
     # may appear truncated and will be silently skipped by json.JSONDecodeError.
-    results = []
     try:
-        with open(LOG_PATH, "rb") as f:
-            mm = None
-            try:
-                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                pos = mm.size()
-                while pos > 0 and len(results) < limit:
-                    prev = mm.rfind(b"\n", 0, pos - 1)
-                    line = mm[max(prev + 1, 0):pos].strip()
-                    pos = prev if prev >= 0 else 0
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not _record_matches(record, q, client_f, internet_only):
-                        continue
-                    results.append(record)
-            except ValueError:
-                pass  # empty file
-            finally:
-                if mm is not None:
-                    mm.close()
+        f = open(LOG_PATH, "rb")
     except OSError:
-        pass
-    return results
+        return
+    try:
+        try:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except ValueError:
+            return  # empty file
+        try:
+            pos = mm.size()
+            yielded = 0
+            while pos > 0 and yielded < limit:
+                prev = mm.rfind(b"\n", 0, pos - 1)
+                line = mm[prev + 1:pos].strip()
+                pos = prev if prev >= 0 else 0
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not _record_matches(record, q, client_f, internet_only):
+                    continue
+                yield record
+                yielded += 1
+        finally:
+            mm.close()
+    finally:
+        f.close()
 
 
 if __name__ == "__main__":
