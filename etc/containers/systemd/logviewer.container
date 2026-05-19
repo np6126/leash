@@ -15,7 +15,7 @@ Volume=/var/lib/leash/logs:/logs:Z
 Volume=/etc/leash:/etc/leash:Z
 
 Environment=LOG_PATH=/logs/egress.jsonl
-Environment=ALLOWLIST_PATH=/etc/leash/allowlist.yaml
+Environment=LEASH_DIR=/etc/leash
 Environment=PORT=8090
 Environment=BODY_LIMIT_KB=1024
 

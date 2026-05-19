@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Logviewer: serves the leash audit log as a filterable web UI.
-PyYAML is required for allowlist management (added to container image).
+Logviewer: serves the leash audit log + policy management as a web UI.
+
+Policy files live under LEASH_DIR (default /etc/leash):
+    mode              — single-line: "enforce" | "audit" | "blocklist"
+    agents.yaml       — { agent_networks: [...] } (gate /api/policy mutations)
+    enforce.yaml      — { allow:    [{host, ports, paths?}, ...] }
+    blocklist.yaml    — { block:    [{host, ports, paths?} | "host", ...] }
+
+Mode and both policy files are hot-reloaded by the addon. The logviewer's
+own cache is also mtime-keyed and refreshes on edit.
 """
 
 import ipaddress
@@ -18,12 +26,18 @@ import yaml
 
 LOG_PATH = os.environ.get("LOG_PATH", "/logs/leash.jsonl")
 PORT = int(os.environ.get("PORT", "8090"))
-ALLOWLIST_PATH = os.environ.get("ALLOWLIST_PATH", "/etc/leash/allowlist.yaml")
+LEASH_DIR = os.environ.get("LEASH_DIR", "/etc/leash")
+MODE_PATH      = os.path.join(LEASH_DIR, "mode")
+AGENTS_PATH    = os.path.join(LEASH_DIR, "agents.yaml")
+ENFORCE_PATH   = os.path.join(LEASH_DIR, "enforce.yaml")
+BLOCKLIST_PATH = os.path.join(LEASH_DIR, "blocklist.yaml")
 BODY_LIMIT_KB = int(os.environ.get("BODY_LIMIT_KB", "1024"))
+
 _LOGVIEWER_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_DIR = os.path.join(_LOGVIEWER_DIR, "static")
 _TEMPLATES_DIR = os.path.join(_LOGVIEWER_DIR, "templates")
 
+_VALID_MODES = ("enforce", "audit", "blocklist")
 _INVALID_FIELD_RE = re.compile(r'[\r\n\x00]')
 
 
@@ -72,6 +86,13 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(length))
 
+    def _gate_agent_source(self) -> bool:
+        """Return True (and send 403) if the request is from an agent network."""
+        if _is_agent_source(self.client_address[0]):
+            self.send_json(403, {"error": "not available from agent network"})
+            return True
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
 
@@ -113,11 +134,16 @@ class Handler(BaseHTTPRequestHandler):
                 total_lines = 0
             self.send_json(200, {"size_mb": size_mb, "total_lines": total_lines, "body_limit_kb": BODY_LIMIT_KB})
 
-        elif parsed.path == "/api/allowlist":
-            if _is_agent_source(self.client_address[0]):
-                self.send_json(403, {"error": "not available from agent network"})
+        elif parsed.path == "/api/mode":
+            self.send_json(200, {"mode": _load_mode()})
+
+        elif parsed.path == "/api/health":
+            self.send_json(200, _health_snapshot())
+
+        elif parsed.path == "/api/policy":
+            if self._gate_agent_source():
                 return
-            self.send_json(200, _load_allowlist())
+            self.send_json(200, _policy_snapshot())
 
         else:
             self.send_json(404, {"error": "not found"})
@@ -125,36 +151,234 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/logs/clear":
             try:
-                with open(LOG_PATH, "w"):
-                    pass
+                _clear_log()
                 self.send_json(200, {"ok": True})
             except OSError as e:
                 self.send_json(500, {"error": str(e)})
+            return
 
-        elif self.path in ("/api/allowlist/add", "/api/allowlist/remove"):
-            if _is_agent_source(self.client_address[0]):
-                self.send_json(403, {"error": "not available from agent network"})
+        if self.path in ("/api/policy/enforce/add", "/api/policy/enforce/remove",
+                         "/api/policy/blocklist/add", "/api/policy/blocklist/remove"):
+            if self._gate_agent_source():
                 return
+            parts = self.path.split("/")        # ['', 'api', 'policy', '<list>', '<verb>']
+            list_name = parts[3]
+            verb = parts[4]
             try:
-                fn = _allowlist_add if self.path.endswith("/add") else _allowlist_remove
-                self.send_json(200, fn(self._read_body()))
+                fn = _policy_add if verb == "add" else _policy_remove
+                self.send_json(200, fn(list_name, self._read_body()))
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
+            return
 
-        else:
-            self.send_json(404, {"error": "not found"})
+        if self.path == "/api/mode":
+            if self._gate_agent_source():
+                return
+            try:
+                body = self._read_body()
+                mode = str(body.get("mode", "")).strip()
+                if mode not in _VALID_MODES:
+                    self.send_json(400, {"error": f"mode must be one of {_VALID_MODES}"})
+                    return
+                _save_mode(mode)
+                self.send_json(200, {"ok": True, "mode": mode})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
+        self.send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        # Alias for POST /api/mode — semantically a PUT is a better fit for
+        # "set mode" but we keep POST working too for clients that can't PUT.
+        if self.path == "/api/mode":
+            self.do_POST()
+            return
+        self.send_json(404, {"error": "not found"})
 
 
 # ── Static file cache (mtime-keyed; invalidated automatically on disk change) ──
 
 _static_lock: threading.Lock = threading.Lock()
-_static_cache: dict[str, tuple[float, bytes]] = {}  # path → (mtime, content)
+_static_cache: dict[str, tuple[float, bytes]] = {}
 
-# ── Allowlist helpers ─────────────────────────────────────────────────────────
+# ── Policy helpers ────────────────────────────────────────────────────────────
+
+# Maps API list name → (file path, yaml top-level key).
+# Resolved lazily on each call so tests can monkeypatch the module-level paths.
+def _policy_meta(name: str) -> tuple[str, str]:
+    if name == "enforce":
+        return ENFORCE_PATH, "allow"
+    if name == "blocklist":
+        return BLOCKLIST_PATH, "block"
+    raise ValueError(f"unknown policy list: {name}")
+
+
+_policy_lock: threading.Lock = threading.Lock()
+# name → (mtime, normalized list of entries)
+_policy_cache: dict[str, tuple[float, list]] = {}
+# Serialises read→modify→write cycles per list.
+_policy_mgmt_lock: threading.Lock = threading.Lock()
+
+
+def _normalize_host(host: str) -> str:
+    host = host.strip()
+    if host.startswith("*."):
+        host = host[2:]
+    return host
+
+
+def _normalize_entry(entry, *, allow_bare_string: bool) -> dict | None:
+    """Return a {host, ports, paths?} dict, or None to skip the entry."""
+    if isinstance(entry, str):
+        if not allow_bare_string:
+            return None
+        host = _normalize_host(entry)
+        if not host:
+            return None
+        return {"host": host, "ports": [443]}
+    if not isinstance(entry, dict):
+        return None
+    host = _normalize_host(str(entry.get("host", "")))
+    if not host:
+        return None
+    out: dict = {"host": host, "ports": list(entry.get("ports") or [443])}
+    paths = entry.get("paths")
+    if paths:
+        norm_paths = []
+        for r in paths:
+            if isinstance(r, dict) and r.get("prefix"):
+                norm_paths.append({
+                    "method": str(r.get("method", "")).upper(),
+                    "prefix": str(r.get("prefix", "/")),
+                })
+        if norm_paths:
+            out["paths"] = norm_paths
+    return out
+
+
+def _load_policy(name: str) -> list:
+    """Load and normalize a policy list. Returns a list of {host, ports, paths?} dicts."""
+    path, key = _policy_meta(name)
+    allow_bare = (name == "blocklist")
+    try:
+        mtime = os.path.getmtime(path)
+        with _policy_lock:
+            cached = _policy_cache.get(name)
+            if cached and cached[0] == mtime:
+                return cached[1]
+        with open(path) as fh:
+            data = yaml.safe_load(fh) or {}
+        raw_entries = data.get(key) or []
+        normalized = []
+        for entry in raw_entries:
+            norm = _normalize_entry(entry, allow_bare_string=allow_bare)
+            if norm is not None:
+                normalized.append(norm)
+        with _policy_lock:
+            _policy_cache[name] = (mtime, normalized)
+        return normalized
+    except OSError:
+        return []
+
+
+def _save_policy(name: str, entries: list) -> None:
+    path, key = _policy_meta(name)
+    lines: list[str] = []
+    if not entries:
+        lines.append(f"{key}: []\n")
+    else:
+        lines.append(f"{key}:\n")
+        for entry in entries:
+            host = entry.get("host", "")
+            ports = entry.get("ports") or [443]
+            lines.append(f"  - host: {json.dumps(host)}\n")
+            lines.append(f"    ports: [{', '.join(str(p) for p in ports)}]\n")
+            paths = entry.get("paths")
+            if paths:
+                lines.append("    paths:\n")
+                for rule in paths:
+                    lines.append(f"      - method: {json.dumps(rule.get('method', ''))}\n")
+                    lines.append(f"        prefix: {json.dumps(rule.get('prefix', '/'))}\n")
+    dir_path = os.path.dirname(os.path.abspath(path))
+    os.makedirs(dir_path, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".tmp") as tmp:
+        tmp.writelines(lines)
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
+    with _policy_lock:
+        _policy_cache.pop(name, None)
+
+
+def _load_agents() -> list[str]:
+    try:
+        with open(AGENTS_PATH) as fh:
+            data = yaml.safe_load(fh) or {}
+        return list(data.get("agent_networks") or [])
+    except OSError:
+        return []
+
+
+def _load_mode() -> str:
+    try:
+        with open(MODE_PATH) as fh:
+            value = fh.read().strip()
+        return value if value in _VALID_MODES else "enforce"
+    except OSError:
+        return "enforce"
+
+
+def _save_mode(mode: str) -> None:
+    if mode not in _VALID_MODES:
+        raise ValueError(f"invalid mode: {mode}")
+    dir_path = os.path.dirname(os.path.abspath(MODE_PATH))
+    os.makedirs(dir_path, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".tmp") as tmp:
+        tmp.write(mode + "\n")
+        tmp_path = tmp.name
+    os.replace(tmp_path, MODE_PATH)
+
+
+def _policy_snapshot() -> dict:
+    return {
+        "mode": _load_mode(),
+        "enforce": _load_policy("enforce"),
+        "blocklist": _load_policy("blocklist"),
+    }
+
+
+def _health_snapshot() -> dict:
+    """Active mode + per-list counts + warnings on misconfigurations the operator
+    would otherwise only notice after a confusing 403 stream or a security hole."""
+    mode = _load_mode()
+    enforce = _load_policy("enforce")
+    blocklist = _load_policy("blocklist")
+    agents = _load_agents()
+    warnings: list[str] = []
+    if not agents:
+        warnings.append(
+            "agents.yaml has no networks — the policy-mutation API is reachable from any client IP"
+        )
+    if mode == "enforce" and not enforce:
+        warnings.append(
+            "enforce mode is active but enforce.yaml is empty — every request will be blocked"
+        )
+    if mode == "blocklist" and not blocklist:
+        warnings.append(
+            "blocklist mode is active but blocklist.yaml is empty — nothing will be blocked"
+        )
+    return {
+        "mode": mode,
+        "enforce_entries": len(enforce),
+        "blocklist_entries": len(blocklist),
+        "agents_entries": len(agents),
+        "warnings": warnings,
+    }
+
 
 def _is_agent_source(client_ip: str) -> bool:
-    """True if client_ip is in any network listed under agent_networks in the allowlist."""
-    networks = _load_allowlist().get("agent_networks") or []
+    """True if client_ip is in any network listed under agent_networks."""
+    networks = _load_agents()
     try:
         addr = ipaddress.ip_address(client_ip)
         return any(addr in ipaddress.ip_network(n, strict=False) for n in networks)
@@ -162,88 +386,22 @@ def _is_agent_source(client_ip: str) -> bool:
         return False
 
 
-_allowlist_cache: tuple[float, dict] = (0.0, {})
-_allowlist_lock: threading.Lock = threading.Lock()
-# Serialises the read→modify→write cycle in _allowlist_add/_allowlist_remove.
-# Without this, two concurrent POST requests could each load the same state and
-# silently overwrite each other's changes.
-_allowlist_mgmt_lock: threading.Lock = threading.Lock()
-
-
-def _load_allowlist() -> dict:
-    global _allowlist_cache
-    try:
-        mtime = os.path.getmtime(ALLOWLIST_PATH)
-        with _allowlist_lock:
-            if mtime == _allowlist_cache[0]:
-                return _allowlist_cache[1]
-        with open(ALLOWLIST_PATH) as fh:
-            data = yaml.safe_load(fh) or {}
-        data["allowed_destinations"] = data.get("allowed_destinations") or []
-        data["agent_networks"] = data.get("agent_networks") or []
-        with _allowlist_lock:
-            _allowlist_cache = (mtime, data)
-        return data
-    except OSError:
-        return {"allowed_destinations": [], "agent_networks": []}
-
-
-def _save_allowlist(data: dict) -> None:
-    global _allowlist_cache
-    lines: list[str] = []
-
-    # Preserve agent_networks — dropping this would disable the security block
-    # that prevents agent VMs from calling the allowlist management endpoints.
-    networks = data.get("agent_networks") or []
-    if networks:
-        lines.append("agent_networks:\n")
-        for net in networks:
-            lines.append(f"  - {net}\n")
-        lines.append("\n")
-
-    entries = data.get("allowed_destinations") or []
-    # Write "allowed_destinations: []" explicitly when empty so YAML doesn't
-    # parse the key-with-no-value back as None on the next load.
-    if not entries:
-        lines.append("allowed_destinations: []\n")
-    else:
-        lines.append("allowed_destinations:\n")
-    for entry in entries:
-        host = entry.get("host", "")
-        ports = entry.get("ports", [443])
-        lines.append(f"  - host: {json.dumps(host)}\n")
-        lines.append(f"    ports: [{', '.join(str(p) for p in ports)}]\n")
-        paths = entry.get("paths")
-        if paths:
-            lines.append("    paths:\n")
-            for rule in paths:
-                lines.append(f"      - method: {json.dumps(rule.get('method', ''))}\n")
-                lines.append(f"        prefix: {json.dumps(rule.get('prefix', '/'))}\n")
-    # Atomic write: write to temp file then rename to avoid partial reads by the proxy addon
-    dir_path = os.path.dirname(os.path.abspath(ALLOWLIST_PATH))
-    os.makedirs(dir_path, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".tmp") as tmp:
-        tmp.writelines(lines)
-        tmp_path = tmp.name
-    os.replace(tmp_path, ALLOWLIST_PATH)
-    with _allowlist_lock:
-        _allowlist_cache = (0.0, {})
-
-
 def _validate_fields(host: str, method: str, prefix: str) -> str | None:
-    """Return an error string if any value contains characters that would break YAML output."""
+    # Guards untrusted HTTP body before it reaches the YAML writer. The addon
+    # trusts what it loads because the only paths into the file are this
+    # function (POST /api/policy/*) and operator hand-edits.
     for val, name in ((host, "host"), (method, "method"), (prefix, "prefix")):
         if _INVALID_FIELD_RE.search(val):
             return f"{name} contains invalid characters"
     return None
 
 
-def _allowlist_add(body: dict) -> dict:
+def _policy_add(list_name: str, body: dict) -> dict:
     host = str(body.get("host", "")).strip()
     if not host:
         return {"ok": False, "error": "host required"}
-    port   = int(body.get("port", 443))
-    scope  = str(body.get("scope", "host"))
+    port = int(body.get("port", 443))
+    scope = str(body.get("scope", "host"))
     method = str(body.get("method", "")).upper()
     prefix = str(body.get("prefix", "/"))
 
@@ -251,14 +409,13 @@ def _allowlist_add(body: dict) -> dict:
     if err:
         return {"ok": False, "error": err}
 
-    with _allowlist_mgmt_lock:
-        data  = _load_allowlist()
-        dests = data["allowed_destinations"]
-        entry = next((e for e in dests if e.get("host") == host), None)
+    with _policy_mgmt_lock:
+        entries = _load_policy(list_name)
+        entry = next((e for e in entries if e.get("host") == host), None)
 
         if scope == "host":
             if entry is None:
-                dests.append({"host": host, "ports": [port]})
+                entries.append({"host": host, "ports": [port]})
             else:
                 if port not in entry.get("ports", []):
                     entry.setdefault("ports", []).append(port)
@@ -266,7 +423,7 @@ def _allowlist_add(body: dict) -> dict:
         else:
             if entry is None:
                 entry = {"host": host, "ports": [port], "paths": []}
-                dests.append(entry)
+                entries.append(entry)
             else:
                 if port not in entry.get("ports", []):
                     entry.setdefault("ports", []).append(port)
@@ -275,15 +432,15 @@ def _allowlist_add(body: dict) -> dict:
             if not any(p.get("method") == method and p.get("prefix") == prefix for p in paths):
                 paths.append({"method": method, "prefix": prefix})
 
-        _save_allowlist(data)
-        return {"ok": True, "allowlist": data}
+        _save_policy(list_name, entries)
+        return {"ok": True, "policy": _policy_snapshot()}
 
 
-def _allowlist_remove(body: dict) -> dict:
+def _policy_remove(list_name: str, body: dict) -> dict:
     host = str(body.get("host", "")).strip()
     if not host:
         return {"ok": False, "error": "host required"}
-    scope  = str(body.get("scope", "host"))
+    scope = str(body.get("scope", "host"))
     method = str(body.get("method", "")).upper()
     prefix = str(body.get("prefix", "/"))
 
@@ -291,14 +448,13 @@ def _allowlist_remove(body: dict) -> dict:
     if err:
         return {"ok": False, "error": err}
 
-    with _allowlist_mgmt_lock:
-        data  = _load_allowlist()
-        dests = data["allowed_destinations"]
+    with _policy_mgmt_lock:
+        entries = _load_policy(list_name)
 
         if scope == "host":
-            data["allowed_destinations"] = [e for e in dests if e.get("host") != host]
+            entries = [e for e in entries if e.get("host") != host]
         else:
-            entry = next((e for e in dests if e.get("host") == host), None)
+            entry = next((e for e in entries if e.get("host") == host), None)
             if entry and entry.get("paths"):
                 entry["paths"] = [
                     p for p in entry["paths"]
@@ -307,8 +463,8 @@ def _allowlist_remove(body: dict) -> dict:
                 if not entry["paths"]:
                     del entry["paths"]
 
-        _save_allowlist(data)
-        return {"ok": True, "allowlist": data}
+        _save_policy(list_name, entries)
+        return {"ok": True, "policy": _policy_snapshot()}
 
 
 # ── Log reading helpers ───────────────────────────────────────────────────────
@@ -320,8 +476,6 @@ def _is_lan(host: str) -> bool:
     """True if host is a private/loopback IP or a known local hostname."""
     if not host:
         return False
-    # Try the bare value first (handles plain IPv6 like "::1"), then strip a
-    # trailing ":port" suffix (handles "host:port" and "[::1]:port" notation).
     for candidate in (host.strip("[]"), host.rsplit(":", 1)[0].strip("[]")):
         try:
             addr = ipaddress.ip_address(candidate)
@@ -337,11 +491,21 @@ def _is_lan(host: str) -> bool:
             or h_lower.endswith(".fritz.box"))
 
 
-_count_cache: tuple[float, int] = (0.0, 0)  # (mtime, count)
+_count_cache: tuple[float, int] = (0.0, 0)
 _count_lock: threading.Lock = threading.Lock()
-
-# Cannot appear inside a JSON string value because interior quotes are backslash-escaped.
 _CONNECT_MARKER = b'"event": "connect_allowed"'
+
+
+def _clear_log() -> None:
+    # Truncate in place rather than open("w"): the latter creates a fresh
+    # inode if the file is missing, which orphans any append-mode fd the
+    # proxy addon may be holding. r+ requires the file to exist; if it
+    # doesn't, there's nothing to clear and we exit silently.
+    try:
+        with open(LOG_PATH, "r+b") as f:
+            f.truncate(0)
+    except FileNotFoundError:
+        pass
 
 
 def _count_lines() -> int:
@@ -377,9 +541,6 @@ def _record_matches(record: dict, q: str, client_f: str, internet_only: bool) ->
 
 
 def _iter_logs(q: str, client_f: str, limit: int, internet_only: bool = False):
-    # The proxy addon appends to this file concurrently. POSIX append semantics
-    # prevent torn writes, but a line being written exactly as the mmap is built
-    # may appear truncated and will be silently skipped by json.JSONDecodeError.
     try:
         f = open(LOG_PATH, "rb")
     except OSError:
@@ -388,7 +549,7 @@ def _iter_logs(q: str, client_f: str, limit: int, internet_only: bool = False):
         try:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         except ValueError:
-            return  # empty file
+            return
         try:
             pos = mm.size()
             yielded = 0

@@ -1,0 +1,10 @@
+# Networks from which agents reach the proxy. The log viewer (port 8090)
+# refuses policy-mutation API calls (POST /api/policy/*, POST /api/mode)
+# from any IP listed here — that's the only application-level control
+# preventing an agent from whitelisting (or unblocking) itself.
+#
+# Edit before exposing the log viewer; the default ships with the
+# tank-claw agent network from the README example.
+
+agent_networks:
+  - 10.10.10.0/24

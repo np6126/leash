@@ -1,7 +1,7 @@
 mitmproxy-ca-cert.pem
 addon/__pycache__/
-config/allowlist.local.yaml
-deploy-allowlist-local.sh
+config/*.local.yaml
+deploy-policy.sh
 tests/__pycache__/
 logviewer/__pycache__/
 .claude/

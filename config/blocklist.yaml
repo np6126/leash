@@ -1,0 +1,17 @@
+# Active when /etc/leash/mode == "blocklist".
+# Everything passes EXCEPT hosts listed here, which are 403'd.
+#
+# Schema is permissive — most entries are just hostnames:
+#
+#   block:
+#     - pastebin.com           # bare string, equivalent to {host, ports: [443]}
+#     - "*.doubleclick.net"    # the *. prefix is informational (parent-domain
+#                              # matching does the same job automatically)
+#     - host: github.com       # object form with path-specific block
+#       paths: [{ prefix: /raw/ }]
+#       reason: "no raw-file fetches"
+#
+# Hostname matching uses parent-domain fallback: `doubleclick.net`
+# also blocks `ads.doubleclick.net`, `googleads.doubleclick.net`, etc.
+
+block: []

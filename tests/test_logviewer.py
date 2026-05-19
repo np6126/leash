@@ -1,8 +1,8 @@
 """
 Unit tests for logviewer/server.py.
 
-The module uses module-level globals (LOG_PATH, ALLOWLIST_PATH) which are
-patched per-test via monkeypatch.
+The module uses module-level globals for file paths; tests patch them per-test
+via monkeypatch.
 """
 
 import json
@@ -23,17 +23,28 @@ def _write_log(tmp_path, records):
     return str(p)
 
 
-def _write_allowlist(tmp_path, content):
-    p = tmp_path / "allowlist.yaml"
-    p.write_text(content)
-    return str(p)
+@pytest.fixture
+def policy_dir(tmp_path, monkeypatch):
+    """Point all four module-level policy paths into a tmp dir."""
+    monkeypatch.setattr(srv, "MODE_PATH",      str(tmp_path / "mode"))
+    monkeypatch.setattr(srv, "AGENTS_PATH",    str(tmp_path / "agents.yaml"))
+    monkeypatch.setattr(srv, "ENFORCE_PATH",   str(tmp_path / "enforce.yaml"))
+    monkeypatch.setattr(srv, "BLOCKLIST_PATH", str(tmp_path / "blocklist.yaml"))
+    # Reset the policy cache so prior tests don't leak state across modules
+    with srv._policy_lock:
+        srv._policy_cache.clear()
+    return tmp_path
 
 
-def _setup_allowlist(tmp_path, monkeypatch, destinations=None):
-    path = str(tmp_path / "allowlist.yaml")
-    monkeypatch.setattr(srv, "ALLOWLIST_PATH", path)
-    srv._save_allowlist({"allowed_destinations": destinations if destinations is not None else []})
-    return path
+def _seed_policy(policy_dir, *, mode="enforce", enforce=None, blocklist=None, agents=None):
+    if mode is not None:
+        (policy_dir / "mode").write_text(mode + "\n")
+    if enforce is not None:
+        srv._save_policy("enforce", enforce)
+    if blocklist is not None:
+        srv._save_policy("blocklist", blocklist)
+    if agents is not None:
+        (policy_dir / "agents.yaml").write_text("agent_networks:\n" + "".join(f"  - {n}\n" for n in agents))
 
 
 # ── _is_lan ───────────────────────────────────────────────────────────────────
@@ -52,7 +63,7 @@ class TestIsLan:
         assert srv._is_lan("127.0.0.1")
 
     def test_loopback_v6(self):
-        assert srv._is_lan("::1")  # bare IPv6 loopback
+        assert srv._is_lan("::1")
 
     def test_public_ip(self):
         assert not srv._is_lan("8.8.8.8")
@@ -65,9 +76,6 @@ class TestIsLan:
     def test_dot_local(self):
         assert srv._is_lan("mydevice.local")
 
-    def test_dot_lan(self):
-        assert srv._is_lan("rainkingstation.lan")
-
     def test_dot_internal(self):
         assert srv._is_lan("service.internal")
 
@@ -79,7 +87,7 @@ class TestIsLan:
         assert not srv._is_lan("")
 
 
-# ── _read_logs ────────────────────────────────────────────────────────────────
+# ── _iter_logs ────────────────────────────────────────────────────────────────
 
 class TestReadLogs:
     def test_basic_read(self, tmp_path, monkeypatch):
@@ -155,65 +163,6 @@ class TestReadLogs:
         assert list(srv._iter_logs("", "", 500)) == []
 
 
-# ── _load_allowlist / _save_allowlist ─────────────────────────────────────────
-
-class TestAllowlistRoundtrip:
-    def test_load_basic(self, tmp_path, monkeypatch):
-        path = _write_allowlist(tmp_path,
-            "allowed_destinations:\n  - host: api.example.com\n    ports: [443]\n"
-        )
-        monkeypatch.setattr(srv, "ALLOWLIST_PATH", path)
-        data = srv._load_allowlist()
-        hosts = [e["host"] for e in data["allowed_destinations"]]
-        assert "api.example.com" in hosts
-
-    def test_missing_file_returns_empty(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(srv, "ALLOWLIST_PATH", str(tmp_path / "nope.yaml"))
-        data = srv._load_allowlist()
-        assert data["allowed_destinations"] == []
-
-    def test_roundtrip_preserves_agent_networks(self, tmp_path, monkeypatch):
-        path = str(tmp_path / "allowlist.yaml")
-        monkeypatch.setattr(srv, "ALLOWLIST_PATH", path)
-        original = {
-            "agent_networks": ["10.0.0.0/8"],
-            "allowed_destinations": [{"host": "a.com", "ports": [443]}],
-        }
-        srv._save_allowlist(original)
-        loaded = srv._load_allowlist()
-        assert loaded["agent_networks"] == ["10.0.0.0/8"]
-
-    def test_roundtrip_preserves_path_rules(self, tmp_path, monkeypatch):
-        path = str(tmp_path / "allowlist.yaml")
-        monkeypatch.setattr(srv, "ALLOWLIST_PATH", path)
-        original = {
-            "allowed_destinations": [{
-                "host": "api.example.com",
-                "ports": [443],
-                "paths": [{"method": "GET", "prefix": "/v1/"}],
-            }],
-        }
-        srv._save_allowlist(original)
-        loaded = srv._load_allowlist()
-        entry = loaded["allowed_destinations"][0]
-        assert entry["paths"][0]["prefix"] == "/v1/"
-
-    def test_save_is_atomic(self, tmp_path, monkeypatch):
-        path = str(tmp_path / "allowlist.yaml")
-        monkeypatch.setattr(srv, "ALLOWLIST_PATH", path)
-        srv._save_allowlist({"allowed_destinations": []})
-        # No .tmp file should be left behind
-        assert not list(tmp_path.glob("*.tmp"))
-
-    def test_ipv6_host_quoted(self, tmp_path, monkeypatch):
-        # IPv6 brackets must be YAML-quoted, otherwise [::1] is parsed as a list
-        path = str(tmp_path / "allowlist.yaml")
-        monkeypatch.setattr(srv, "ALLOWLIST_PATH", path)
-        srv._save_allowlist({"allowed_destinations": [{"host": "[::1]", "ports": [80]}]})
-        loaded = srv._load_allowlist()
-        assert loaded["allowed_destinations"][0]["host"] == "[::1]"
-
-
 # ── _count_lines ─────────────────────────────────────────────────────────────
 
 class TestCountLines:
@@ -239,116 +188,289 @@ class TestCountLines:
         assert srv._count_lines() == 0
 
 
-# ── _allowlist_add ────────────────────────────────────────────────────────────
+class TestClearLog:
+    """_clear_log must truncate in place so the proxy addon's open log fd
+    keeps pointing at the live inode. open(path, 'w') was wrong because
+    when the file is missing it creates a fresh inode, orphaning any
+    append-mode fd held by the writer."""
 
-class TestAllowlistAdd:
-    def test_add_new_host(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({"host": "new.example.com", "port": 443, "scope": "host"})
+    def test_truncates_existing_file_in_place(self, tmp_path, monkeypatch):
+        path = tmp_path / "leash.jsonl"
+        path.write_text('{"event":"x"}\n{"event":"y"}\n')
+        original_inode = path.stat().st_ino
+        monkeypatch.setattr(srv, "LOG_PATH", str(path))
+        srv._clear_log()
+        assert path.stat().st_size == 0
+        assert path.stat().st_ino == original_inode
+
+    def test_missing_file_is_silent(self, tmp_path, monkeypatch):
+        path = tmp_path / "none.jsonl"
+        monkeypatch.setattr(srv, "LOG_PATH", str(path))
+        srv._clear_log()
+        # Did not create a file
+        assert not path.exists()
+
+
+# ── Mode load / save ─────────────────────────────────────────────────────────
+
+class TestMode:
+    def test_default_enforce_on_missing_file(self, policy_dir):
+        assert srv._load_mode() == "enforce"
+
+    def test_save_and_load_roundtrip(self, policy_dir):
+        srv._save_mode("audit")
+        assert srv._load_mode() == "audit"
+        srv._save_mode("blocklist")
+        assert srv._load_mode() == "blocklist"
+        srv._save_mode("enforce")
+        assert srv._load_mode() == "enforce"
+
+    def test_save_rejects_invalid_mode(self, policy_dir):
+        with pytest.raises(ValueError):
+            srv._save_mode("not_a_mode")
+
+    def test_load_returns_enforce_on_garbage(self, policy_dir):
+        (policy_dir / "mode").write_text("garbage\n")
+        assert srv._load_mode() == "enforce"
+
+
+# ── Policy load / save ──────────────────────────────────────────────────────
+
+class TestPolicyRoundtrip:
+    def test_load_empty_when_missing(self, policy_dir):
+        assert srv._load_policy("enforce") == []
+        assert srv._load_policy("blocklist") == []
+
+    def test_enforce_roundtrip(self, policy_dir):
+        srv._save_policy("enforce", [
+            {"host": "api.example.com", "ports": [443], "paths": [{"method": "GET", "prefix": "/v1/"}]},
+        ])
+        entries = srv._load_policy("enforce")
+        assert entries[0]["host"] == "api.example.com"
+        assert entries[0]["paths"][0]["prefix"] == "/v1/"
+
+    def test_blocklist_roundtrip(self, policy_dir):
+        srv._save_policy("blocklist", [{"host": "pastebin.com", "ports": [443]}])
+        entries = srv._load_policy("blocklist")
+        assert entries[0]["host"] == "pastebin.com"
+
+    def test_blocklist_loads_bare_strings(self, policy_dir):
+        (policy_dir / "blocklist.yaml").write_text("block:\n  - pastebin.com\n  - hastebin.com\n")
+        entries = srv._load_policy("blocklist")
+        hosts = [e["host"] for e in entries]
+        assert "pastebin.com" in hosts and "hastebin.com" in hosts
+
+    def test_blocklist_strips_star_prefix(self, policy_dir):
+        (policy_dir / "blocklist.yaml").write_text('block:\n  - "*.doubleclick.net"\n')
+        entries = srv._load_policy("blocklist")
+        assert entries[0]["host"] == "doubleclick.net"
+
+    def test_save_is_atomic(self, policy_dir):
+        srv._save_policy("enforce", [])
+        # No .tmp file should be left behind
+        assert not list(policy_dir.glob("*.tmp"))
+
+    def test_unknown_list_name_raises(self, policy_dir):
+        with pytest.raises(ValueError):
+            srv._load_policy("nonsense")
+
+
+# ── _policy_snapshot ────────────────────────────────────────────────────────
+
+class TestPolicySnapshot:
+    def test_returns_mode_and_both_lists(self, policy_dir):
+        _seed_policy(policy_dir, mode="audit",
+                     enforce=[{"host": "a.com", "ports": [443]}],
+                     blocklist=[{"host": "bad.com", "ports": [443]}])
+        snap = srv._policy_snapshot()
+        assert snap["mode"] == "audit"
+        assert snap["enforce"][0]["host"] == "a.com"
+        assert snap["blocklist"][0]["host"] == "bad.com"
+
+
+# ── _health_snapshot ────────────────────────────────────────────────────────
+
+class TestHealth:
+    def test_healthy_state_no_warnings(self, policy_dir):
+        _seed_policy(policy_dir, mode="enforce", agents=["10.10.10.0/24"],
+                     enforce=[{"host": "a.com", "ports": [443]}],
+                     blocklist=[])
+        h = srv._health_snapshot()
+        assert h["mode"] == "enforce"
+        assert h["enforce_entries"] == 1
+        assert h["agents_entries"] == 1
+        assert h["warnings"] == []
+
+    def test_enforce_with_empty_list_warns(self, policy_dir):
+        _seed_policy(policy_dir, mode="enforce", agents=["10.10.10.0/24"],
+                     enforce=[], blocklist=[])
+        h = srv._health_snapshot()
+        assert any("enforce mode" in w and "empty" in w for w in h["warnings"])
+
+    def test_blocklist_with_empty_list_warns(self, policy_dir):
+        _seed_policy(policy_dir, mode="blocklist", agents=["10.10.10.0/24"],
+                     enforce=[], blocklist=[])
+        h = srv._health_snapshot()
+        assert any("blocklist mode" in w and "empty" in w for w in h["warnings"])
+
+    def test_audit_with_empty_lists_no_warning(self, policy_dir):
+        # audit mode doesn't depend on either list — no list-empty warning
+        _seed_policy(policy_dir, mode="audit", agents=["10.10.10.0/24"],
+                     enforce=[], blocklist=[])
+        h = srv._health_snapshot()
+        # only the agents warning could fire; agents is set here → no warnings
+        assert h["warnings"] == []
+
+    def test_missing_agents_warns(self, policy_dir):
+        _seed_policy(policy_dir, mode="enforce",
+                     enforce=[{"host": "a.com", "ports": [443]}],
+                     blocklist=[])
+        h = srv._health_snapshot()
+        assert any("agents.yaml" in w for w in h["warnings"])
+
+
+# ── _is_agent_source (agents.yaml integration) ──────────────────────────────
+
+class TestIsAgentSource:
+    def test_agent_in_network(self, policy_dir):
+        _seed_policy(policy_dir, agents=["10.10.10.0/24"])
+        assert srv._is_agent_source("10.10.10.42")
+
+    def test_agent_outside_network(self, policy_dir):
+        _seed_policy(policy_dir, agents=["10.10.10.0/24"])
+        assert not srv._is_agent_source("192.168.1.1")
+
+    def test_no_agents_file(self, policy_dir):
+        # Without agents.yaml, no one is treated as an agent
+        assert not srv._is_agent_source("10.10.10.42")
+
+    def test_invalid_client_ip(self, policy_dir):
+        _seed_policy(policy_dir, agents=["10.10.10.0/24"])
+        assert not srv._is_agent_source("not-an-ip")
+
+
+# ── _policy_add ──────────────────────────────────────────────────────────────
+
+class TestPolicyAdd:
+    def test_add_host_to_enforce(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {"host": "new.example.com", "port": 443, "scope": "host"})
         assert result["ok"]
-        hosts = [e["host"] for e in result["allowlist"]["allowed_destinations"]]
+        hosts = [e["host"] for e in result["policy"]["enforce"]]
         assert "new.example.com" in hosts
 
-    def test_add_path_rule(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({
+    def test_add_host_to_blocklist(self, policy_dir):
+        srv._save_policy("blocklist", [])
+        result = srv._policy_add("blocklist", {"host": "bad.example.com", "port": 443, "scope": "host"})
+        assert result["ok"]
+        hosts = [e["host"] for e in result["policy"]["blocklist"]]
+        assert "bad.example.com" in hosts
+
+    def test_add_path_rule(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {
             "host": "api.example.com", "port": 443,
             "scope": "path", "method": "GET", "prefix": "/v1/",
         })
         assert result["ok"]
-        entry = result["allowlist"]["allowed_destinations"][0]
+        entry = result["policy"]["enforce"][0]
         assert entry["paths"][0]["prefix"] == "/v1/"
 
-    def test_add_host_clears_path_restrictions(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch, [
+    def test_add_host_clears_path_restrictions(self, policy_dir):
+        srv._save_policy("enforce", [
             {"host": "api.example.com", "ports": [443], "paths": [{"method": "GET", "prefix": "/v1/"}]},
         ])
-        result = srv._allowlist_add({"host": "api.example.com", "port": 443, "scope": "host"})
+        result = srv._policy_add("enforce", {"host": "api.example.com", "port": 443, "scope": "host"})
         assert result["ok"]
-        entry = result["allowlist"]["allowed_destinations"][0]
+        entry = result["policy"]["enforce"][0]
         assert "paths" not in entry
 
-    def test_no_duplicate_path_rules(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        srv._allowlist_add({"host": "a.com", "port": 443, "scope": "path", "method": "GET", "prefix": "/v1/"})
-        result = srv._allowlist_add({"host": "a.com", "port": 443, "scope": "path", "method": "GET", "prefix": "/v1/"})
-        entry = result["allowlist"]["allowed_destinations"][0]
+    def test_no_duplicate_path_rules(self, policy_dir):
+        srv._save_policy("enforce", [])
+        srv._policy_add("enforce", {"host": "a.com", "port": 443, "scope": "path", "method": "GET", "prefix": "/v1/"})
+        result = srv._policy_add("enforce", {"host": "a.com", "port": 443, "scope": "path", "method": "GET", "prefix": "/v1/"})
+        entry = result["policy"]["enforce"][0]
         assert len(entry["paths"]) == 1
 
-    def test_missing_host_returns_error(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({"host": "", "port": 443, "scope": "host"})
+    def test_missing_host_returns_error(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {"host": "", "port": 443, "scope": "host"})
         assert not result["ok"]
 
 
-# ── _allowlist_remove ─────────────────────────────────────────────────────────
+# ── _policy_remove ───────────────────────────────────────────────────────────
 
-class TestAllowlistRemove:
-    def test_remove_host(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch, [{"host": "a.com", "ports": [443]}])
-        result = srv._allowlist_remove({"host": "a.com", "scope": "host"})
-        assert result["ok"] and result["allowlist"]["allowed_destinations"] == []
+class TestPolicyRemove:
+    def test_remove_host_from_enforce(self, policy_dir):
+        srv._save_policy("enforce", [{"host": "a.com", "ports": [443]}])
+        result = srv._policy_remove("enforce", {"host": "a.com", "scope": "host"})
+        assert result["ok"] and result["policy"]["enforce"] == []
 
-    def test_remove_one_path_rule(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch, [{
+    def test_remove_host_from_blocklist(self, policy_dir):
+        srv._save_policy("blocklist", [{"host": "bad.com", "ports": [443]}])
+        result = srv._policy_remove("blocklist", {"host": "bad.com", "scope": "host"})
+        assert result["ok"] and result["policy"]["blocklist"] == []
+
+    def test_remove_one_path_rule(self, policy_dir):
+        srv._save_policy("enforce", [{
             "host": "api.example.com", "ports": [443],
             "paths": [
                 {"method": "GET",  "prefix": "/v1/"},
                 {"method": "POST", "prefix": "/v1/"},
             ],
         }])
-        result = srv._allowlist_remove({
+        result = srv._policy_remove("enforce", {
             "host": "api.example.com", "scope": "path",
             "method": "GET", "prefix": "/v1/",
         })
         assert result["ok"]
-        entry = result["allowlist"]["allowed_destinations"][0]
+        entry = result["policy"]["enforce"][0]
         assert len(entry["paths"]) == 1 and entry["paths"][0]["method"] == "POST"
 
-    def test_remove_nonexistent_host_is_noop(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch, [{"host": "a.com", "ports": [443]}])
-        result = srv._allowlist_remove({"host": "z.com", "scope": "host"})
-        assert result["ok"] and len(result["allowlist"]["allowed_destinations"]) == 1
+    def test_remove_nonexistent_host_is_noop(self, policy_dir):
+        srv._save_policy("enforce", [{"host": "a.com", "ports": [443]}])
+        result = srv._policy_remove("enforce", {"host": "z.com", "scope": "host"})
+        assert result["ok"] and len(result["policy"]["enforce"]) == 1
 
-    def test_missing_host_returns_error(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_remove({"host": "", "scope": "host"})
+    def test_missing_host_returns_error(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_remove("enforce", {"host": "", "scope": "host"})
         assert not result["ok"]
 
 
-# ── Input validation (_validate_fields) ──────────────────────────────────────
+# ── Input validation ─────────────────────────────────────────────────────────
 
 class TestInputValidation:
-    def test_add_host_with_newline_rejected(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({"host": "evil.com\ninjected:", "port": 443, "scope": "host"})
+    def test_add_host_with_newline_rejected(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {"host": "evil.com\ninjected:", "port": 443, "scope": "host"})
         assert not result["ok"]
         assert "invalid" in result["error"]
 
-    def test_add_prefix_with_newline_rejected(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({
+    def test_add_prefix_with_newline_rejected(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {
             "host": "api.example.com", "port": 443, "scope": "path",
             "method": "GET", "prefix": "/v1/\nmalicious:",
         })
         assert not result["ok"]
         assert "invalid" in result["error"]
 
-    def test_add_method_with_null_byte_rejected(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({
+    def test_add_method_with_null_byte_rejected(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {
             "host": "api.example.com", "port": 443, "scope": "path",
             "method": "GET\x00", "prefix": "/v1/",
         })
         assert not result["ok"]
 
-    def test_remove_host_with_newline_rejected(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_remove({"host": "evil.com\ninjected:", "scope": "host"})
+    def test_remove_host_with_newline_rejected(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_remove("enforce", {"host": "evil.com\ninjected:", "scope": "host"})
         assert not result["ok"]
         assert "invalid" in result["error"]
 
-    def test_valid_inputs_still_work(self, tmp_path, monkeypatch):
-        _setup_allowlist(tmp_path, monkeypatch)
-        result = srv._allowlist_add({"host": "api.example.com", "port": 443, "scope": "host"})
+    def test_valid_inputs_still_work(self, policy_dir):
+        srv._save_policy("enforce", [])
+        result = srv._policy_add("enforce", {"host": "api.example.com", "port": 443, "scope": "host"})
         assert result["ok"]

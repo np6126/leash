@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# leashctl — terminal frontend for the leash policy files.
+# Reads/writes /etc/leash/{mode,enforce.yaml,blocklist.yaml}; the proxy
+# hot-reloads on the next request — no service restart needed.
+set -euo pipefail
+
+LEASH_DIR="${LEASH_DIR:-/etc/leash}"
+MODE_FILE="$LEASH_DIR/mode"
+ENFORCE_FILE="$LEASH_DIR/enforce.yaml"
+BLOCKLIST_FILE="$LEASH_DIR/blocklist.yaml"
+VALID_MODES=(enforce audit blocklist)
+
+_die() { echo "leashctl: $*" >&2; exit 1; }
+
+_validate_yaml() {
+    python3 -c "import yaml; yaml.safe_load(open('$1'))" 2>/dev/null \
+        || _die "$1 is not valid YAML — proxy will keep using the previous state"
+}
+
+_current_mode() {
+    # cat preserves the trailing newline so direct output is well-formed;
+    # bash command substitution ($(...)) strips it for case-matching callers.
+    [[ -r "$MODE_FILE" ]] && cat "$MODE_FILE" || echo enforce
+}
+
+cmd_mode() {
+    if [[ $# -eq 0 ]]; then
+        _current_mode
+        return
+    fi
+    local target="$1"
+    [[ " ${VALID_MODES[*]} " == *" $target "* ]] \
+        || _die "unknown mode: $target (must be one of: ${VALID_MODES[*]})"
+    local tmp
+    tmp=$(mktemp -p "$LEASH_DIR" .mode.XXXXXX)
+    echo "$target" > "$tmp"
+    mv "$tmp" "$MODE_FILE"
+    echo "mode → $target"
+}
+
+cmd_edit() {
+    local target="${1:-}"
+    local file
+    case "$target" in
+        enforce)   file="$ENFORCE_FILE" ;;
+        blocklist) file="$BLOCKLIST_FILE" ;;
+        "")
+            case "$(_current_mode)" in
+                enforce)   file="$ENFORCE_FILE" ;;
+                blocklist) file="$BLOCKLIST_FILE" ;;
+                audit)     _die "audit mode has no policy file — run 'leashctl edit enforce' or 'leashctl edit blocklist' explicitly" ;;
+                *)         _die "unknown current mode" ;;
+            esac
+            ;;
+        *) _die "edit target must be 'enforce' or 'blocklist'" ;;
+    esac
+    "${EDITOR:-vi}" "$file"
+    _validate_yaml "$file"
+    echo "$(basename "$file") saved · YAML valid · proxy will reload on next request"
+}
+
+cmd_help() {
+    cat <<'EOF'
+Usage: leashctl <command>
+
+Commands:
+    mode                              show current mode
+    mode <enforce|audit|blocklist>    switch mode (hot-reload, no restart)
+    edit                              open active mode's policy file in $EDITOR
+    edit <enforce|blocklist>          open named file in $EDITOR
+EOF
+}
+
+case "${1:-}" in
+    mode)              shift; cmd_mode "$@" ;;
+    edit)              shift; cmd_edit "$@" ;;
+    ""|-h|--help|help) cmd_help ;;
+    *) _die "unknown command: $1 (see 'leashctl help')" ;;
+esac

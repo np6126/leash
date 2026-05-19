@@ -1,0 +1,59 @@
+# Active when /etc/leash/mode == "enforce" (the default).
+# Only hosts listed here may pass. Everything else is 403 before TLS.
+#
+# Hostname matching uses parent-domain fallback: an entry for `github.com`
+# also matches `api.github.com`, `gist.github.com`, etc.
+#
+# Path rules (optional): when `paths` is present, the request must match
+# at least one entry. `method: ""` is a wildcard. Without `paths`, every
+# request to the host on the listed ports is allowed.
+
+allow:
+  # Container registries — clawx image pulls are routed through this proxy.
+  - host: quay.io
+    ports: [443]
+    paths:
+      - method: GET
+        prefix: /v2/
+      - method: HEAD
+        prefix: /v2/fedora/fedora/
+
+  - host: cdn01.quay.io
+    ports: [443]
+    paths:
+      - method: GET
+        prefix: /quayio-production-s3/
+
+  # Common services — uncomment what you need.
+  # - host: api.anthropic.com
+  #   ports: [443]
+  #   paths:
+  #     - { method: POST, prefix: /v1/messages }
+  #     - { method: GET,  prefix: /v1/models }
+  #
+  # - host: api.openai.com
+  #   ports: [443]
+  #   paths:
+  #     - { method: POST, prefix: /v1/chat/completions }
+  #     - { method: GET,  prefix: /v1/models }
+  #
+  # - host: github.com         # also matches api.github.com, gist.github.com, …
+  #   ports: [443]
+  # - host: githubusercontent.com
+  #   ports: [443]
+  #
+  # - host: pypi.org
+  #   ports: [443]
+  # - host: pythonhosted.org
+  #   ports: [443]
+  #
+  # - host: npmjs.org
+  #   ports: [443]
+  # - host: npmjs.com
+  #   ports: [443]
+  #
+  # - host: crates.io
+  #   ports: [443]
+  #
+  # - host: stackoverflow.com
+  #   ports: [443]

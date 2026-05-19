@@ -14,6 +14,13 @@
     <img src="/logo.svg" width="22" height="22" style="border-radius:5px;display:block" alt="leash">
     leash <span class="logo-sub">/ audit log</span>
   </div>
+
+  <div class="mode-switcher" id="mode-switcher" role="tablist" aria-label="Operation mode">
+    <button class="mode-seg" data-mode="enforce"   role="tab" aria-selected="true"  onclick="switchMode('enforce')">Enforce</button>
+    <button class="mode-seg" data-mode="audit"     role="tab" aria-selected="false" onclick="switchMode('audit')">Audit</button>
+    <button class="mode-seg" data-mode="blocklist" role="tab" aria-selected="false" onclick="switchMode('blocklist')">Blocklist</button>
+  </div>
+
   <div class="header-right">
     <div class="stat">Log size: <strong id="log-size">—</strong></div>
     <div class="divider"></div>
@@ -38,6 +45,17 @@
   </div>
 </header>
 
+<div id="mode-banner" class="mode-banner" hidden>
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+    <line x1="12" y1="9" x2="12" y2="13"/>
+    <line x1="12" y1="17" x2="12.01" y2="17"/>
+  </svg>
+  <span id="mode-banner-text"></span>
+</div>
+
+<div id="health-banner" class="health-banner" hidden></div>
+
 <div class="filters">
   <div class="input-wrap">
     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -52,9 +70,14 @@
     </svg>
     <input type="text" id="client" placeholder="Filter by client IP" oninput="onFilter()">
   </div>
-  <button class="toggle-btn" id="internet-toggle" onclick="toggleInternetOnly()" title="Versteckt Anfragen zu privaten IPs (RFC 1918)">
+  <button class="toggle-btn" id="internet-toggle" onclick="toggleInternetOnly()" title="Hides requests to private IPs (RFC 1918)">
     <span class="toggle-dot"></span>
     Internet only
+  </button>
+  <button class="toggle-btn toggle-btn-warn" id="wouldblock-toggle" onclick="toggleWouldBlock()" hidden
+          title="Show only requests that would have been blocked in enforce mode">
+    <span class="toggle-dot"></span>
+    Would block in enforce
   </button>
   <span id="filter-spinner" class="filter-spinner" style="opacity:0"></span>
   <span id="fetch-error" class="fetch-error" style="display:none" title="Log server unreachable — retrying…">⚠ disconnected</span>
@@ -90,6 +113,22 @@
       <button class="dialog-close" onclick="closeDialog()" title="Close (Esc)">✕</button>
     </div>
     <div id="dialog-body" class="dialog-body"></div>
+  </div>
+</div>
+
+<div id="mode-confirm-overlay" class="dialog-overlay" style="display:none" onclick="closeModeConfirmIfBg(event)">
+  <div class="dialog-card mode-confirm-card" onclick="event.stopPropagation()">
+    <div class="dialog-header">
+      <span class="dialog-title" id="mode-confirm-title">Switch mode?</span>
+      <button class="dialog-close" onclick="closeModeConfirm()" title="Close (Esc)">✕</button>
+    </div>
+    <div class="dialog-body">
+      <p id="mode-confirm-body" class="mode-confirm-body"></p>
+      <div class="dialog-actions">
+        <button class="btn-dialog btn-cancel" onclick="closeModeConfirm()">Cancel</button>
+        <button class="btn-dialog btn-mode-confirm" id="mode-confirm-ok" onclick="confirmModeSwitch()">Switch</button>
+      </div>
+    </div>
   </div>
 </div>
 

@@ -73,17 +73,21 @@ function _fmtBytesValue(b) {
   return `${(b/1048576).toFixed(1)} MB`;
 }
 
-function fmtEvent(ev) {
+function fmtEvent(r) {
   const ch = '<svg class="ev-chev" width="7" height="7" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="2,1 6,4 2,7"/></svg>';
-  if (ev === 'allowed') return `<span class="event-dot ev-allowed">${ch}allowed</span>`;
-  if (ev === 'blocked') return `<span class="event-dot ev-blocked">${ch}blocked</span>`;
-  if (ev === 'error')   return `<span class="event-dot ev-error">${ch}error</span>`;
-  return `<span class="event-dot">${ch}${ev}</span>`;
+  const wb = r.audit === 'would_block_in_enforce' ? '<span class="wb-chip" title="Would block in enforce mode">would block</span>' : '';
+  if (r.event === 'allowed')      return `<span class="event-dot ev-allowed">${ch}allowed</span>${wb}`;
+  if (r.event === 'blocked')      return `<span class="event-dot ev-blocked">${ch}blocked</span>`;
+  if (r.event === 'error')        return `<span class="event-dot ev-error">${ch}error</span>`;
+  if (r.event === 'mode_change')  return `<span class="event-dot ev-mode">${ch}mode</span>`;
+  return `<span class="event-dot">${ch}${r.event}</span>`;
 }
 
-function rowClass(ev) {
-  if (ev === 'blocked') return 'row-blocked';
-  if (ev === 'error') return 'row-error';
+function rowClass(r) {
+  if (r.event === 'blocked') return 'row-blocked';
+  if (r.event === 'error') return 'row-error';
+  if (r.event === 'mode_change') return 'row-mode';
+  if (r.audit === 'would_block_in_enforce') return 'row-would-block';
   return '';
 }
 
@@ -94,6 +98,7 @@ function esc(s) {
 // ── Filters ──────────────────────────────────────────────────────────────────
 
 let internetOnly = false;
+let wouldBlockOnly = false;
 
 function toggleInternetOnly() {
   internetOnly = !internetOnly;
@@ -101,17 +106,21 @@ function toggleInternetOnly() {
   fetchLogs(true);
 }
 
-// ── Row state ─────────────────────────────────────────────────────────────────
-// Each row gets a stable integer id (nextId++) that never changes, even when
-// new rows are prepended. This lets expandedId survive incremental updates.
+function toggleWouldBlock() {
+  wouldBlockOnly = !wouldBlockOnly;
+  document.getElementById('wouldblock-toggle').classList.toggle('active', wouldBlockOnly);
+  fetchLogs(true);
+}
 
-let nextId        = 0;    // monotonically increasing row counter
-let rowById       = {};   // id → row data
-let currentIds    = [];   // ordered display ids (newest first)
-let expandedId    = null; // currently expanded row id (integer), or null
-let topTs         = null; // ts of the first (newest) displayed row
-let bodyLimitKb   = 1024; // updated from /api/meta on load; matches BODY_LIMIT_KB server default
-let _fetchFails   = 0;    // consecutive fetchLogs failures; triggers disconnect indicator at 3
+// ── Row state ─────────────────────────────────────────────────────────────────
+
+let nextId        = 0;
+let rowById       = {};
+let currentIds    = [];
+let expandedId    = null;
+let topTs         = null;
+let bodyLimitKb   = 1024;
+let _fetchFails   = 0;
 
 // ── Sort state ────────────────────────────────────────────────────────────────
 
@@ -119,8 +128,11 @@ let sortKey = null;
 let sortDir = -1;
 
 function _displayIds() {
-  if (!sortKey) return currentIds;
-  return [...currentIds].sort((a, b) => {
+  const ids = wouldBlockOnly
+    ? currentIds.filter(id => rowById[id].audit === 'would_block_in_enforce')
+    : currentIds;
+  if (!sortKey) return ids;
+  return [...ids].sort((a, b) => {
     const va = rowById[a][sortKey];
     const vb = rowById[b][sortKey];
     if (va == null && vb == null) return 0;
@@ -177,7 +189,7 @@ function _resetRows() {
   nextId = 0; rowById = {}; currentIds = []; expandedId = null; topTs = null;
 }
 
-// ── Render (full re-render) ───────────────────────────────────────────────────
+// ── Render ────────────────────────────────────────────────────────────────────
 
 function render(rows) {
   const tbody   = document.getElementById('tbody');
@@ -202,7 +214,6 @@ function render(rows) {
     return;
   }
   empty.style.display = 'none';
-  countEl.textContent = rows.length + (rows.length >= 500 ? '+' : '') + ' entries';
   topTs = rows[0].ts;
 
   for (const r of rows) {
@@ -211,24 +222,30 @@ function render(rows) {
     currentIds.push(id);
   }
 
-  tbody.innerHTML = _displayIds().map(id => buildRowHtml(id)).join('');
+  const ids = _displayIds();
+  countEl.textContent = ids.length + (rows.length >= 500 ? '+' : '') + ' entries';
+  tbody.innerHTML = ids.map(id => buildRowHtml(id)).join('');
   _updateSortHeaders();
 
   if (prevTs !== null) {
     const newId = currentIds.find(id => rowById[id].ts === prevTs);
     if (newId !== undefined) {
-      document.getElementById('detail-' + newId).style.display = '';
-      document.querySelector(`tr.data-row[data-rid="${newId}"]`).classList.add('row-expanded');
-      expandedId = newId;
-      if (prevScrolls.length) {
-        document.querySelectorAll(`#detail-${newId} .detail-body-pre`)
-          .forEach((el, i) => { if (i < prevScrolls.length) el.scrollTop = prevScrolls[i]; });
+      const detailEl = document.getElementById('detail-' + newId);
+      const rowEl = document.querySelector(`tr.data-row[data-rid="${newId}"]`);
+      if (detailEl && rowEl) {
+        detailEl.style.display = '';
+        rowEl.classList.add('row-expanded');
+        expandedId = newId;
+        if (prevScrolls.length) {
+          document.querySelectorAll(`#detail-${newId} .detail-body-pre`)
+            .forEach((el, i) => { if (i < prevScrolls.length) el.scrollTop = prevScrolls[i]; });
+        }
       }
     }
   }
 }
 
-// ── Incremental prepend (auto-refresh path) ───────────────────────────────────
+// ── Incremental prepend ───────────────────────────────────────────────────────
 
 function prependRows(newRows) {
   const tbody   = document.getElementById('tbody');
@@ -243,18 +260,29 @@ function prependRows(newRows) {
   topTs = rowById[newIds[0]].ts;
 
   document.getElementById('empty').style.display = 'none';
-  if (sortKey) {
+  if (sortKey || wouldBlockOnly) {
     _rebuildTbody();
   } else {
     tbody.insertAdjacentHTML('afterbegin', newIds.map(id => buildRowHtml(id)).join(''));
   }
-  countEl.textContent = currentIds.length + (currentIds.length >= 500 ? '+' : '') + ' entries';
+  const visible = _displayIds().length;
+  countEl.textContent = visible + (currentIds.length >= 500 ? '+' : '') + ' entries';
 }
 
 // ── Row HTML ──────────────────────────────────────────────────────────────────
 
 function buildRowHtml(id) {
-  const r   = rowById[id];
+  const r = rowById[id];
+  if (r.event === 'mode_change') {
+    const summary = `mode changed: ${esc(r.previous || '?')} → <strong style="color:var(--text)">${esc(r.mode || '?')}</strong>`;
+    return `<tr class="data-row row-mode" data-rid="${id}">
+      <td>${fmtTime(r.ts)}</td>
+      <td class="mono" style="color:var(--muted2)">—</td>
+      <td class="mono" colspan="2" style="color:var(--muted2);font-style:italic">${summary}</td>
+      <td>${fmtEvent(r)}</td>
+    </tr>
+    <tr class="detail-row" id="detail-${id}" style="display:none"><td colspan="5">${buildDetailPanel(id)}</td></tr>`;
+  }
   const displayText = r.url || r.host || '—';
   const titleText = (!r.url && r.host && r.port) ? `${r.host}:${r.port}` : displayText;
   const methodBadge = r.method ? fmtMethod(r.method) : '';
@@ -263,12 +291,12 @@ function buildRowHtml(id) {
     : '';
   const urlHtml = `${methodBadge}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">${esc(displayText)}</span>${portBadge}`;
   const bytesInline = r.bytes ? `<span class="col-bytes-inline">${_fmtBytesValue(r.bytes)}</span>` : '';
-  return `<tr class="data-row ${rowClass(r.event)}" data-rid="${id}">
+  return `<tr class="data-row ${rowClass(r)}" data-rid="${id}">
     <td>${fmtTime(r.ts)}<span class="mobile-client"> · ${esc(r.client || '')}</span></td>
     <td class="mono" style="color:var(--muted2)">${esc(r.client || '—')}</td>
     <td class="mono" title="${esc(titleText)}" style="display:flex;align-items:center">${urlHtml}</td>
     <td>${fmtStatus(r.status)}${bytesInline}</td>
-    <td>${fmtEvent(r.event)}</td>
+    <td>${fmtEvent(r)}</td>
   </tr>
   <tr class="detail-row" id="detail-${id}" style="display:none">
     <td colspan="5">${buildDetailPanel(id)}</td>
@@ -291,11 +319,6 @@ function buildHeadersBlock(headers, highlightKey) {
 const _unescape = s => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '');
 
 function _sanitizeJsonStrings(text) {
-  // Escape unescaped control characters inside JSON string values.
-  // Needed because Python's json.dumps encodes \n as \\n, but the browser's
-  // JSON.parse of the API response decodes it back to a real newline —
-  // making a subsequent JSON.parse of the body text fail (bare newlines in
-  // JSON strings are invalid).
   const out = [];
   let inStr = false, escaped = false;
   for (let i = 0; i < text.length; i++) {
@@ -312,7 +335,6 @@ function _sanitizeJsonStrings(text) {
 }
 
 function _dumbIndent(text) {
-  // Best-effort indenter for truncated or otherwise un-parseable JSON.
   const IND = '  ';
   const out = [];
   let depth = 0, inStr = false, escaped = false;
@@ -335,16 +357,10 @@ function _dumbIndent(text) {
 }
 
 function prettyBody(text) {
-  // 1. Valid complete JSON
   try { return _unescape(JSON.stringify(JSON.parse(text), null, 2)); } catch (_) {}
-  // 2. Valid JSON whose string values contain bare newlines (Python json.dumps
-  //    encodes them as \n, but browser JSON.parse decodes them back to real
-  //    newlines — making a second JSON.parse fail on the body text)
   try { return _unescape(JSON.stringify(JSON.parse(_sanitizeJsonStrings(text)), null, 2)); } catch (_) {}
-  // 3. Truncated / invalid JSON that at least starts like a JSON object or array
   const t = text.trimStart();
   if (t[0] === '{' || t[0] === '[') return _unescape(_dumbIndent(text));
-  // 4. SSE: format each data: line individually
   if (/^data: /m.test(text)) {
     return text.split('\n').map(line => {
       if (!line.startsWith('data: ') || line === 'data: [DONE]') return line;
@@ -389,8 +405,19 @@ function buildBodyBlock(body, truncated) {
 
 function buildDetailPanel(id) {
   const r = rowById[id];
-  const manageBtn = `<button class="btn-manage-access" onclick="event.stopPropagation();showAllowlistDialog(rowById[${id}])">Manage Access</button>`;
+  const manageBtn = `<button class="btn-manage-access" onclick="event.stopPropagation();showAccessDialog(rowById[${id}])">Manage Access</button>`;
   const footer = `<div class="detail-footer">${manageBtn}</div>`;
+
+  if (r.event === 'mode_change') {
+    return `<div class="detail-panel single-col"><div class="detail-section">
+      <div class="detail-section-title">MODE CHANGE</div>
+      <div style="font-family:var(--mono);font-size:12px;line-height:1.7">
+        <div>previous mode: <strong>${esc(r.previous || '?')}</strong></div>
+        <div>new mode:      <strong style="color:var(--yellow)">${esc(r.mode || '?')}</strong></div>
+        <div style="color:var(--muted2);margin-top:8px;font-size:11px">Detected by the proxy on the next request after /etc/leash/mode was rewritten.</div>
+      </div>
+    </div></div>`;
+  }
 
   if (r.event === 'connect_allowed') {
     return `<div class="detail-panel single-col"><div class="detail-tunnel-msg">CONNECT tunnel established — no HTTP headers or body available for this event.</div>${footer}</div>`;
@@ -466,8 +493,6 @@ function onFilter() {
 }
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
-// full=true  → always re-render the entire table (filter change, first load, clear)
-// full=false → only prepend rows newer than topTs; touch nothing else
 
 async function fetchLogs(full = false) {
   const q       = document.getElementById('q').value;
@@ -499,45 +524,187 @@ async function fetchLogs(full = false) {
   }
 }
 
-// ── Allowlist state ───────────────────────────────────────────────────────────
+// ── Mode ──────────────────────────────────────────────────────────────────────
 
-let allowlist    = { allowed_destinations: [] };
+let currentMode = 'enforce';
+let pendingMode = null;
+
+const _modeBanners = {
+  enforce: null,
+  audit: {
+    cls: 'mode-audit',
+    html: '<strong>AUDIT</strong> — everything is logged, nothing is blocked.',
+  },
+  blocklist: {
+    cls: 'mode-blocklist',
+    html: '<strong>BLOCKLIST</strong> — only blocklist hits are blocked. All other traffic passes through.',
+  },
+};
+
+const _modeTitles = {
+  enforce:   'leash · audit log',
+  audit:     'leash · AUDIT MODE',
+  blocklist: 'leash · BLOCKLIST MODE',
+};
+
+function updateModeUI(mode) {
+  if (mode === currentMode && document.querySelector(`.mode-seg[data-mode="${mode}"][aria-selected="true"]`)) {
+    return;  // already in sync — skip the redundant DOM writes the 5s poll would otherwise trigger
+  }
+  currentMode = mode;
+  document.title = _modeTitles[mode] || _modeTitles.enforce;
+  document.querySelectorAll('.mode-seg').forEach(btn => {
+    btn.setAttribute('aria-selected', String(btn.dataset.mode === mode));
+  });
+  const banner = document.getElementById('mode-banner');
+  const text   = document.getElementById('mode-banner-text');
+  banner.classList.remove('mode-audit', 'mode-blocklist');
+  const info = _modeBanners[mode];
+  if (info) {
+    banner.classList.add(info.cls);
+    text.innerHTML = info.html;
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+    text.innerHTML = '';
+  }
+  const wbToggle = document.getElementById('wouldblock-toggle');
+  if (mode === 'enforce') {
+    wbToggle.hidden = true;
+    if (wouldBlockOnly) { wouldBlockOnly = false; wbToggle.classList.remove('active'); _rebuildTbody(); }
+  } else {
+    wbToggle.hidden = false;
+  }
+}
+
+async function fetchMode() {
+  try {
+    const res = await fetch('/api/mode');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.mode) updateModeUI(data.mode);
+  } catch (_) {}
+}
+
+let _lastHealthWarnings = null;
+
+async function fetchHealth() {
+  try {
+    const res = await fetch('/api/health');
+    if (!res.ok) return;
+    const data = await res.json();
+    updateHealthUI(data.warnings || []);
+  } catch (_) {}
+}
+
+function updateHealthUI(warnings) {
+  // Idempotency: skip the DOM write when the warning set didn't change.
+  const key = warnings.join('\n');
+  if (key === _lastHealthWarnings) return;
+  _lastHealthWarnings = key;
+
+  const banner = document.getElementById('health-banner');
+  if (!warnings.length) {
+    banner.hidden = true;
+    banner.innerHTML = '';
+    return;
+  }
+  const icon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
+  banner.innerHTML = warnings.map(w => `<div class="health-row">${icon}<span>${esc(w)}</span></div>`).join('');
+  banner.hidden = false;
+}
+
+function switchMode(target) {
+  if (target === currentMode) return;
+  if (target === 'enforce') {
+    // Tightening: no confirm needed.
+    _applyModeSwitch(target);
+    return;
+  }
+  pendingMode = target;
+  const title = target === 'audit' ? 'Switch to audit mode?' : 'Switch to blocklist mode?';
+  const body  = target === 'audit'
+    ? 'Audit mode <strong>disables all blocking</strong>. Every request will pass through; the proxy only records what happens. Use this for discovery — then flip back to enforce.'
+    : 'Blocklist mode <strong>passes everything except blocklist hits</strong>. Only hosts you have explicitly listed in blocklist.yaml will be blocked.';
+  document.getElementById('mode-confirm-title').textContent = title;
+  document.getElementById('mode-confirm-body').innerHTML = body;
+  document.getElementById('mode-confirm-ok').textContent = 'Switch to ' + target;
+  document.getElementById('mode-confirm-overlay').style.display = 'flex';
+}
+
+async function confirmModeSwitch() {
+  const target = pendingMode;
+  closeModeConfirm();
+  if (target) await _applyModeSwitch(target);
+}
+
+function closeModeConfirm() {
+  document.getElementById('mode-confirm-overlay').style.display = 'none';
+  pendingMode = null;
+}
+
+function closeModeConfirmIfBg(e) {
+  if (e.target.id === 'mode-confirm-overlay') closeModeConfirm();
+}
+
+async function _applyModeSwitch(target) {
+  try {
+    const res = await fetch('/api/mode', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: target }),
+    });
+    const data = await res.json();
+    if (res.ok && data.mode) {
+      updateModeUI(data.mode);
+      showToast(`Mode → ${data.mode}`, target === 'enforce' ? 'added' : 'removed');
+    } else {
+      showToast(data.error || 'Mode switch failed', 'err');
+    }
+  } catch (_) {
+    showToast('Request failed', 'err');
+  }
+}
+
+// ── Policy state (both lists) ────────────────────────────────────────────────
+
+let policy = { mode: 'enforce', enforce: [], blocklist: [] };
 let dialogRecord = null;
 
-async function loadAllowlist() {
+async function loadPolicies() {
   try {
-    const res = await fetch('/api/allowlist');
-    if (res.ok) allowlist = await res.json();
+    const res = await fetch('/api/policy');
+    if (res.ok) policy = await res.json();
   } catch(e) {}
 }
 
-function _findAllowlistEntry(host) {
-  const dests = allowlist.allowed_destinations || [];
-  const direct = dests.find(e => e.host === host);
+function _findEntry(entries, host) {
+  if (!entries || !entries.length) return null;
+  const direct = entries.find(e => e.host === host);
   if (direct) return direct;
   const labels = host.split('.');
   for (let i = 1; i < labels.length - 1; i++) {
     const parent = labels.slice(i).join('.');
-    const entry = dests.find(e => e.host === parent);
+    const entry = entries.find(e => e.host === parent);
     if (entry) return entry;
   }
   return null;
 }
 
-function checkAllowlistStatus(host, port, method, path) {
-  const entry = _findAllowlistEntry(host);
+function _statusForList(entries, host, port, method, path) {
+  const entry = _findEntry(entries, host);
   if (!entry) return { status: 'not_in_list' };
   const ports = (entry.ports || [443]).map(Number);
   if (!ports.includes(Number(port))) return { status: 'not_in_list' };
   const paths = entry.paths;
-  if (!paths || !paths.length) return { status: 'host_allowed', entry };
-  if (!method && !path) return { status: 'host_allowed', entry };
+  if (!paths || !paths.length) return { status: 'host', entry };
+  if (!method && !path) return { status: 'host', entry };
   const matched = paths.some(rule => {
     const mOk = !rule.method || rule.method === (method || '').toUpperCase();
     const pOk = path && path.startsWith(rule.prefix);
     return mOk && pOk;
   });
-  return matched ? { status: 'path_allowed', entry } : { status: 'path_blocked', entry };
+  return matched ? { status: 'path', entry } : { status: 'path_only_others', entry };
 }
 
 function extractPath(url) {
@@ -545,99 +712,116 @@ function extractPath(url) {
   try { return new URL(url).pathname; } catch(_) { return url; }
 }
 
-// ── Dialog ────────────────────────────────────────────────────────────────────
+// ── Manage Access dialog ─────────────────────────────────────────────────────
 
-async function showAllowlistDialog(record) {
-  await loadAllowlist();
+async function showAccessDialog(record) {
+  await loadPolicies();
   dialogRecord = record;
   const host   = record.host   || '';
   const port   = record.port   || 443;
   const method = record.method || '';
   const path   = record.url ? extractPath(record.url) : '';
-  const { status } = checkAllowlistStatus(host, port, method, path);
 
-  const statusMap = {
-    not_in_list:  ['status-blocked', '✗', 'blocked · not in allowlist'],
-    host_allowed: ['status-allowed', '✓', 'allowed · all paths permitted'],
-    path_blocked: ['status-warn',    '⚠', 'path blocked · host is in allowlist'],
-    path_allowed: ['status-allowed', '✓', 'allowed · matched path rule'],
-  };
-  const [cls, icon, label] = statusMap[status];
+  const inEnforce  = _statusForList(policy.enforce,   host, port, method, path);
+  const inBlock    = _statusForList(policy.blocklist, host, port, method, path);
 
-  let html = `<div class="dialog-status ${cls}"><span>${icon}</span>${label}</div>`;
-  html += `<div class="dialog-info">`;
-  html += `<div class="info-row"><span class="info-label">HOST</span><span class="info-value">${esc(host)}</span></div>`;
+  const modeChip = `<span class="mode-chip mode-${currentMode}">${currentMode}</span>`;
+
+  let html = `<div class="dialog-info" style="margin-bottom:14px">`;
+  html += `<div class="info-row"><span class="info-label">HOST</span><span class="info-value">${esc(host)}${modeChip}</span></div>`;
   html += `<div class="info-row"><span class="info-label">PORT</span><span class="info-value">${esc(String(port))}</span></div>`;
   if (method) html += `<div class="info-row"><span class="info-label">METHOD</span><span class="info-value">${esc(method)}</span></div>`;
   if (path)   html += `<div class="info-row"><span class="info-label">PATH</span><span class="info-value">${esc(path)}</span></div>`;
   html += `</div>`;
 
-  if (status === 'not_in_list' || status === 'path_blocked') {
-    const hostTitle = status === 'path_blocked' ? 'Remove path restrictions' : 'Allow entire host';
-    const hostSub   = status === 'path_blocked'
-      ? `All paths on ${esc(host)} will be permitted`
-      : 'All methods · all paths permitted';
-    html += `<div class="dialog-sep"></div><div class="scope-cards" id="scope-cards">`;
-    html += mkCard('host', true,  hostTitle, `${esc(host)}:${port}`, hostSub);
-    if (method && path) {
-      const pathTitle = status === 'path_blocked' ? 'Add this path rule' : 'Allow this path only';
-      html += mkCard('path', false, pathTitle, `${esc(method)} ${esc(path)}`, `on ${esc(host)}`);
-    }
-    html += `</div>`;
-    html += `<div class="dialog-actions">
-      <button class="btn-dialog btn-cancel" onclick="closeDialog()">Cancel</button>
-      <button class="btn-dialog btn-add" onclick="confirmAdd()">${status === 'path_blocked' ? 'Allow' : 'Add to list'}</button>
-    </div>`;
+  html += _renderListSection('enforce', inEnforce, host, port, method, path);
+  html += _renderListSection('blocklist', inBlock, host, port, method, path);
 
-  } else if (status === 'host_allowed') {
-    html += `<div class="dialog-actions">
-      <button class="btn-dialog btn-cancel" onclick="closeDialog()">Cancel</button>
-      <button class="btn-dialog btn-remove" onclick="confirmRemove('host')">Remove from list</button>
-    </div>`;
-
-  } else {
-    html += `<div class="dialog-sep"></div><div class="scope-cards" id="scope-cards">`;
-    const pathFirst = !!(method && path);
-    if (pathFirst) {
-      html += mkCard('path', true,  'Remove this path rule', `${esc(method)} ${esc(path)}`, `Other rules on ${esc(host)} remain`);
-    }
-    html += mkCard('host', !pathFirst, 'Remove entire host', `${esc(host)}:${port}`, 'Removes all rules for this host');
-    html += `</div>`;
-    html += `<div class="dialog-actions">
-      <button class="btn-dialog btn-cancel" onclick="closeDialog()">Cancel</button>
-      <button class="btn-dialog btn-remove" onclick="confirmRemove(getScope())">Remove</button>
-    </div>`;
-  }
+  html += `<div class="dialog-actions" style="margin-top:14px">
+    <button class="btn-dialog btn-cancel" onclick="closeDialog()">Close</button>
+  </div>`;
 
   document.getElementById('dialog-body').innerHTML = html;
   document.getElementById('dialog-overlay').style.display = 'flex';
 }
 
-function mkCard(scope, selected, title, detail, sub) {
-  const cls = selected ? ' selected' : '';
-  const dot = selected ? '●' : '○';
-  return `<div class="scope-card${cls}" data-scope="${scope}" onclick="selectScope(this)">
-    <div class="scope-radio">${dot}</div>
-    <div class="scope-content">
-      <div class="scope-title">${title}</div>
-      <div class="scope-detail">${detail}</div>
-      <div class="scope-sub">${sub}</div>
+function _renderListSection(list, info, host, port, method, path) {
+  const isActiveList = (list === 'enforce' && currentMode === 'enforce')
+                    || (list === 'blocklist' && currentMode === 'blocklist');
+  const title = list === 'enforce' ? 'ENFORCE LIST · allow rules' : 'BLOCKLIST · deny rules';
+
+  // Per-list status label
+  let statusLabel, statusClass;
+  if (info.status === 'not_in_list') {
+    statusLabel = 'not in list';
+    statusClass = '';
+  } else if (info.status === 'host') {
+    statusLabel = 'host listed · all paths';
+    statusClass = list === 'enforce' ? 'is-in' : 'is-block';
+  } else if (info.status === 'path') {
+    statusLabel = 'this path is listed';
+    statusClass = list === 'enforce' ? 'is-in' : 'is-block';
+  } else if (info.status === 'path_only_others') {
+    statusLabel = 'host listed · this path not covered';
+    statusClass = 'is-warn';
+  }
+
+  const activeBadge = isActiveList ? '<span style="color:var(--accent);font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase">· active in current mode</span>' : '';
+
+  let buttons = '';
+  const verb     = list === 'enforce' ? 'Allow' : 'Block';
+  const verbCls  = list === 'enforce' ? 'btn-list-allow' : 'btn-list-block';
+  const hasPath  = !!(method && path);
+
+  if (info.status === 'not_in_list') {
+    buttons += `<button class="btn-list ${verbCls}" onclick="policyAction('${list}','add','host')">${verb} host</button>`;
+    if (hasPath) {
+      buttons += `<button class="btn-list ${verbCls}" onclick="policyAction('${list}','add','path')">${verb} just this path</button>`;
+    }
+  } else if (info.status === 'host') {
+    buttons += `<button class="btn-list btn-list-remove" onclick="policyAction('${list}','remove','host')">Remove host</button>`;
+  } else if (info.status === 'path') {
+    buttons += `<button class="btn-list btn-list-remove" onclick="policyAction('${list}','remove','path')">Remove this path rule</button>`;
+    buttons += `<button class="btn-list btn-list-remove" onclick="policyAction('${list}','remove','host')">Remove entire host</button>`;
+  } else if (info.status === 'path_only_others') {
+    buttons += `<button class="btn-list ${verbCls}" onclick="policyAction('${list}','add','path')">${verb} this path too</button>`;
+    buttons += `<button class="btn-list btn-list-remove" onclick="policyAction('${list}','remove','host')">Remove entire host</button>`;
+  }
+
+  return `<div class="list-section${isActiveList ? ' active' : ''}">
+    <div class="list-section-head">
+      <span class="list-section-title">${title} ${activeBadge}</span>
+      <span class="list-section-status ${statusClass}">${statusLabel}</span>
     </div>
+    <div class="list-section-actions">${buttons}</div>
   </div>`;
 }
 
-function selectScope(card) {
-  document.querySelectorAll('#scope-cards .scope-card').forEach(c => {
-    c.classList.remove('selected');
-    c.querySelector('.scope-radio').textContent = '○';
-  });
-  card.classList.add('selected');
-  card.querySelector('.scope-radio').textContent = '●';
-}
-
-function getScope() {
-  const sel = document.querySelector('#scope-cards .scope-card.selected');
-  return sel ? sel.dataset.scope : 'host';
+async function policyAction(list, action, scope) {
+  if (!dialogRecord) return;
+  const host   = dialogRecord.host || '';
+  const port   = dialogRecord.port || 443;
+  const method = (dialogRecord.method || '').toUpperCase();
+  const prefix = dialogRecord.url ? extractPath(dialogRecord.url) : '/';
+  try {
+    const res = await fetch(`/api/policy/${list}/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host, port, scope, method, prefix }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      policy = data.policy;
+      closeDialog();
+      const what = scope === 'host' ? host : `${method} ${prefix}`;
+      const verb = action === 'add' ? (list === 'enforce' ? 'Allowed' : 'Blocked') : 'Removed';
+      showToast(`${verb}: ${what}`, action === 'add' ? (list === 'enforce' ? 'added' : 'removed') : 'removed');
+    } else {
+      showToast(data.error || 'Policy update failed', 'err');
+    }
+  } catch (_) {
+    showToast('Request failed', 'err');
+  }
 }
 
 function closeDialog() {
@@ -649,53 +833,6 @@ function closeDialogIfBg(e) {
   if (e.target.id === 'dialog-overlay') closeDialog();
 }
 
-async function confirmAdd() {
-  if (!dialogRecord) return;
-  const scope  = getScope();
-  const host   = dialogRecord.host || '';
-  const port   = dialogRecord.port || 443;
-  const method = (dialogRecord.method || '').toUpperCase();
-  const prefix = dialogRecord.url ? extractPath(dialogRecord.url) : '/';
-  try {
-    const res = await fetch('/api/allowlist/add', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host, port, scope, method, prefix }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      allowlist = data.allowlist;
-      closeDialog();
-      showToast('Added: ' + (scope === 'host' ? host : `${method} ${prefix}`), 'added');
-    } else {
-      showToast(data.error || 'Error saving allowlist', 'err');
-    }
-  } catch(_) { showToast('Request failed', 'err'); }
-}
-
-async function confirmRemove(scope) {
-  if (!dialogRecord) return;
-  const host   = dialogRecord.host || '';
-  const port   = dialogRecord.port || 443;
-  const method = (dialogRecord.method || '').toUpperCase();
-  const prefix = dialogRecord.url ? extractPath(dialogRecord.url) : '/';
-  try {
-    const res = await fetch('/api/allowlist/remove', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host, port, scope, method, prefix }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      allowlist = data.allowlist;
-      closeDialog();
-      showToast('Removed: ' + host, 'removed');
-    } else {
-      showToast(data.error || 'Error saving allowlist', 'err');
-    }
-  } catch(_) { showToast('Request failed', 'err'); }
-}
-
 function showToast(msg, type) {
   const el = document.getElementById('toast');
   el.textContent = msg;
@@ -704,7 +841,7 @@ function showToast(msg, type) {
   el._t = setTimeout(() => el.classList.remove('show'), 3000);
 }
 
-// ── Row click (event delegation) ─────────────────────────────────────────────
+// ── Row click ────────────────────────────────────────────────────────────────
 
 document.getElementById('tbody').addEventListener('click', e => {
   if (e.target.closest('.detail-row')) return;
@@ -720,7 +857,11 @@ document.getElementById('tbody').addEventListener('click', e => {
 });
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeDialog(); return; }
+  if (e.key === 'Escape') {
+    if (document.getElementById('mode-confirm-overlay').style.display === 'flex') { closeModeConfirm(); return; }
+    closeDialog();
+    return;
+  }
   if (e.target.closest('input, button, textarea')) return;
   if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
   e.preventDefault();
@@ -737,5 +878,10 @@ document.addEventListener('keydown', e => {
 
 fetchLogs(true);
 fetchMeta();
-loadAllowlist();
-setInterval(() => { fetchLogs(false); fetchMeta(); }, 5000);
+fetchMode();
+fetchHealth();
+loadPolicies();
+// Mode polls at 1s so external flips (leashctl, hand-edit of /etc/leash/mode)
+// converge fast in the UI. Heavier fetches stay on the 5s tick.
+setInterval(fetchMode, 1000);
+setInterval(() => { fetchLogs(false); fetchMeta(); fetchHealth(); }, 5000);

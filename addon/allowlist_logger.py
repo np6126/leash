@@ -1,13 +1,21 @@
 """
-mitmproxy addon: allowlist enforcement + structured JSON logging.
+mitmproxy addon: three-mode policy enforcement + structured JSON logging.
 
-Blocks connections not in the allowlist before the TLS handshake (HTTPS CONNECT)
-and at the HTTP request stage for plaintext traffic. The allowlist file is
-re-read on every connection so changes take effect without restarting the proxy.
+Modes (selected by /etc/leash/mode, single-line plain text):
 
-Each allowlist entry may include an optional `paths` list to restrict which
-HTTP methods and path prefixes are permitted on that host. Entries without
-`paths` allow all paths on the matching host:port.
+    enforce    — only hosts in enforce.yaml may pass. Rest is 403.
+    audit      — everything passes. Nothing is blocked.
+    blocklist  — everything passes except hosts in blocklist.yaml (403).
+
+The policy is hot-reloaded: every connection re-checks file mtimes and reloads
+whichever file changed. Mode flips, allow-rule edits, and blocklist edits all
+take effect on the next request — no restart needed.
+
+In `audit` and `blocklist` modes, when a request passes through, the addon
+additionally evaluates the enforce rules and writes an informational
+`audit: "would_block_in_enforce"` field on rows that would NOT have passed
+in enforce mode. The log viewer renders those rows amber so an operator can
+stage an allowlist against real traffic before flipping to enforce.
 """
 
 import json
@@ -18,16 +26,23 @@ import yaml
 from mitmproxy import ctx, http
 
 BODY_LIMIT = int(os.environ.get("BODY_LIMIT_KB", "1024")) * 1024
+LEASH_DIR = os.environ.get("LEASH_DIR", "/etc/leash")
+
+_VALID_MODES = ("enforce", "audit", "blocklist")
+_DEFAULT_PORTS = (443,)
 
 
 class AllowlistLogger:
     def __init__(self) -> None:
-        self.allowlist_path = os.environ.get(
-            "ALLOWLIST_PATH", "/etc/leash/allowlist.yaml"
-        )
+        self.mode_path      = os.path.join(LEASH_DIR, "mode")
+        self.enforce_path   = os.path.join(LEASH_DIR, "enforce.yaml")
+        self.blocklist_path = os.path.join(LEASH_DIR, "blocklist.yaml")
         self.log_path = os.environ.get("LOG_PATH", "/logs/leash.jsonl")
-        self._allowed: dict[str, dict] = {}
-        self._mtime: float = 0.0
+
+        self._mode: str = "enforce"
+        self._enforce: dict[str, dict] = {}
+        self._block: dict[str, dict] = {}
+        self._mtimes: dict[str, float] = {}
         self._log_fh = None
 
     @staticmethod
@@ -35,83 +50,166 @@ class AllowlistLogger:
         return flow.client_conn.peername[0] if flow.client_conn.peername else None
 
     # ------------------------------------------------------------------
-    # Allowlist loading
+    # Policy loading
     # ------------------------------------------------------------------
 
     def _reload_if_changed(self) -> None:
-        try:
-            mtime = os.path.getmtime(self.allowlist_path)
-        except OSError:
-            return
-        if mtime == self._mtime:
-            return
-        try:
-            with open(self.allowlist_path) as fh:
-                raw = yaml.safe_load(fh) or {}
-            allowed: dict[str, dict] = {}
-            for entry in raw.get("allowed_destinations", []):
-                host = str(entry.get("host", "")).strip()
-                if not host:
-                    continue
-                raw_paths = entry.get("paths")
-                path_rules: list[dict] | None = None
-                if raw_paths:
-                    path_rules = [
-                        {
-                            "method": str(r.get("method", "")).upper(),
-                            "prefix": str(r.get("prefix", "/")),
-                        }
-                        for r in raw_paths
-                        if r.get("prefix")
-                    ] or None
-                allowed[host] = {
-                    "ports": set(entry.get("ports", [443])),
-                    "paths": path_rules,
-                }
-            self._allowed = allowed
-            self._mtime = mtime
-            ctx.log.info(
-                f"leash: allowlist loaded — {len(allowed)} host(s) permitted"
-            )
-        except Exception as exc:
-            ctx.log.error(f"leash: allowlist reload failed: {exc}")
+        loaders = (
+            ("mode",      self.mode_path,      self._load_mode),
+            ("enforce",   self.enforce_path,   self._load_enforce),
+            ("blocklist", self.blocklist_path, self._load_blocklist),
+        )
+        for key, path, loader in loaders:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime == self._mtimes.get(key):
+                continue
+            try:
+                loader(path)
+                self._mtimes[key] = mtime
+            except Exception as exc:
+                ctx.log.error(f"leash: {key} reload failed: {exc}")
 
-    def _find_entry(self, host: str):
-        """Exact match first, then parent-domain wildcard (e.g. api.github.com → github.com)."""
-        entry = self._allowed.get(host)
+    def _load_mode(self, path: str) -> None:
+        with open(path) as fh:
+            value = fh.read().strip()
+        if value not in _VALID_MODES:
+            ctx.log.warn(f"leash: invalid mode {value!r}, defaulting to enforce")
+            value = "enforce"
+        if value != self._mode:
+            previous = self._mode
+            ctx.log.info(f"leash: mode → {value}")
+            self._mode = value
+            self._log_mode_change(previous, value)
+        else:
+            self._mode = value
+
+    def _load_enforce(self, path: str) -> None:
+        with open(path) as fh:
+            raw = yaml.safe_load(fh) or {}
+        rules = self._parse_rules(raw.get("allow") or [], allow_bare_string=False, file_label="enforce.yaml")
+        self._enforce = rules
+        ctx.log.info(f"leash: enforce.yaml loaded — {len(rules)} host(s)")
+
+    def _load_blocklist(self, path: str) -> None:
+        with open(path) as fh:
+            raw = yaml.safe_load(fh) or {}
+        rules = self._parse_rules(raw.get("block") or [], allow_bare_string=True, file_label="blocklist.yaml")
+        self._block = rules
+        ctx.log.info(f"leash: blocklist.yaml loaded — {len(rules)} host(s)")
+
+    @staticmethod
+    def _normalize_host(host: str) -> str:
+        host = host.strip()
+        if host.startswith("*."):
+            host = host[2:]
+        return host
+
+    def _parse_rules(self, entries, *, allow_bare_string: bool, file_label: str = "") -> dict[str, dict]:
+        rules: dict[str, dict] = {}
+        for entry in entries:
+            if isinstance(entry, str):
+                if not allow_bare_string:
+                    ctx.log.warn(
+                        f"leash: {file_label}: bare-string entry {entry!r} ignored "
+                        f"(this list requires `{{host: ..., ports: [...]}}` form)"
+                    )
+                    continue
+                host = self._normalize_host(entry)
+                if host:
+                    rules[host] = {"ports": set(_DEFAULT_PORTS), "paths": None}
+                continue
+            if not isinstance(entry, dict):
+                continue
+            host = self._normalize_host(str(entry.get("host", "")))
+            if not host:
+                continue
+            raw_paths = entry.get("paths")
+            path_rules: list[dict] | None = None
+            if raw_paths:
+                path_rules = [
+                    {
+                        "method": str(r.get("method", "")).upper(),
+                        "prefix": str(r.get("prefix", "/")),
+                    }
+                    for r in raw_paths
+                    if isinstance(r, dict) and r.get("prefix")
+                ] or None
+            rules[host] = {
+                "ports": set(entry.get("ports") or _DEFAULT_PORTS),
+                "paths": path_rules,
+            }
+        return rules
+
+    # ------------------------------------------------------------------
+    # Matching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_entry(rules: dict, host: str):
+        """Exact match first, then parent-domain wildcard (api.github.com → github.com)."""
+        entry = rules.get(host)
         if entry is not None:
             return entry
         labels = host.split(".")
         for i in range(1, len(labels) - 1):
-            entry = self._allowed.get(".".join(labels[i:]))
+            entry = rules.get(".".join(labels[i:]))
             if entry is not None:
                 return entry
         return None
 
-    def _is_allowed(
-        self, host: str, port: int, method: str = "", path: str = ""
+    def _match(
+        self, rules: dict, host: str, port: int, method: str = "", path: str = ""
     ) -> tuple[bool, str]:
         """
-        Return (allowed, reason). reason is non-empty only when blocked.
-
-        If method and path are empty (called from http_connect before TLS),
-        only host:port is checked — path rules are enforced later in request().
+        Returns (matched, mismatch_kind).
+        mismatch_kind is "host" (host or port missing) or "path" (host+port ok,
+        path rejected). Empty when matched.
         """
-        self._reload_if_changed()
-        entry = self._find_entry(host)
+        entry = self._find_entry(rules, host)
         if entry is None or port not in entry["ports"]:
-            return False, "not_in_allowlist"
+            return False, "host"
         path_rules = entry["paths"]
         if path_rules is None or not method or not path:
             return True, ""
         for rule in path_rules:
-            rule_method = rule["method"]
-            rule_prefix = rule["prefix"]
-            if (not rule_method or rule_method == method.upper()) and path.startswith(
-                rule_prefix
-            ):
+            if (not rule["method"] or rule["method"] == method.upper()) and path.startswith(rule["prefix"]):
                 return True, ""
-        return False, "path_not_allowed"
+        return False, "path"
+
+    def _decide(
+        self, host: str, port: int, method: str = "", path: str = ""
+    ) -> tuple[str, str, str]:
+        """
+        Returns (action, reason, audit_decision).
+
+          action          — "pass" | "block"
+          reason          — non-empty only when action == "block"
+                            ("in_blocklist" | "not_in_allowlist" | "path_not_allowed")
+          audit_decision  — non-empty only on pass in non-enforce modes when
+                            the request would have been blocked by enforce rules
+                            ("would_block_in_enforce")
+        """
+        self._reload_if_changed()
+
+        if self._mode == "audit":
+            enforce_matched, _ = self._match(self._enforce, host, port, method, path)
+            return "pass", "", ("" if enforce_matched else "would_block_in_enforce")
+
+        if self._mode == "blocklist":
+            block_matched, _ = self._match(self._block, host, port, method, path)
+            if block_matched:
+                return "block", "in_blocklist", ""
+            enforce_matched, _ = self._match(self._enforce, host, port, method, path)
+            return "pass", "", ("" if enforce_matched else "would_block_in_enforce")
+
+        # enforce
+        matched, reason = self._match(self._enforce, host, port, method, path)
+        if matched:
+            return "pass", "", ""
+        return "block", ("path_not_allowed" if reason == "path" else "not_in_allowlist"), ""
 
     # ------------------------------------------------------------------
     # Capture helpers
@@ -146,6 +244,23 @@ class AllowlistLogger:
     # JSON logging
     # ------------------------------------------------------------------
 
+    def _ensure_log_fh(self) -> None:
+        # If something external rotated/deleted the file (logrotate, manual rm,
+        # logviewer clear-logs creating a fresh inode), the cached fd points at
+        # an orphaned inode and writes are silently lost. Reopen when inode
+        # diverges from the on-disk path.
+        if self._log_fh is not None and not self._log_fh.closed:
+            try:
+                if os.fstat(self._log_fh.fileno()).st_ino == os.stat(self.log_path).st_ino:
+                    return
+            except OSError:
+                pass
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
+        self._log_fh = open(self.log_path, "a")
+
     def _log(
         self,
         event: str,
@@ -158,6 +273,7 @@ class AllowlistLogger:
         reason: str = "",
         status: int = 0,
         size: int = 0,
+        audit: str = "",
         req_headers: list | None = None,
         req_body: str | None = None,
         req_truncated: bool = False,
@@ -182,6 +298,8 @@ class AllowlistLogger:
             record["status"] = status
         if size:
             record["bytes"] = size
+        if audit:
+            record["audit"] = audit
         if req_headers is not None:
             record["req_headers"] = req_headers
         if req_body is not None:
@@ -195,13 +313,28 @@ class AllowlistLogger:
         if res_truncated:
             record["res_truncated"] = True
         try:
-            if self._log_fh is None or self._log_fh.closed:
-                self._log_fh = open(self.log_path, "a")
+            self._ensure_log_fh()
             self._log_fh.write(json.dumps(record) + "\n")
             self._log_fh.flush()
         except OSError as exc:
             self._log_fh = None
             ctx.log.error(f"leash: log write failed: {exc}")
+
+    def _log_mode_change(self, previous: str, current: str) -> None:
+        """Append a structured mode_change event so the JSONL log carries the audit trail."""
+        record = {
+            "ts": time.time(),
+            "event": "mode_change",
+            "previous": previous,
+            "mode": current,
+        }
+        try:
+            self._ensure_log_fh()
+            self._log_fh.write(json.dumps(record) + "\n")
+            self._log_fh.flush()
+        except OSError as exc:
+            self._log_fh = None
+            ctx.log.error(f"leash: mode_change log write failed: {exc}")
 
     # ------------------------------------------------------------------
     # mitmproxy hooks
@@ -210,20 +343,18 @@ class AllowlistLogger:
     def http_connect(self, flow: http.HTTPFlow) -> None:
         """
         Intercept HTTPS CONNECT tunnels before TLS handshake.
-        Blocking here prevents mitmproxy from ever negotiating TLS with the
-        destination, so no bytes reach a disallowed host.
         Path rules are not checked here (path is unknown before TLS);
         they are enforced in request() after interception.
         """
         host = flow.request.host
         port = flow.request.port
         client_ip = self._client_ip(flow)
-        allowed, reason = self._is_allowed(host, port)
-        if not allowed:
+        action, reason, _ = self._decide(host, port)
+        if action == "block":
             self._log("blocked", host, port, client_ip, reason=reason)
             flow.response = http.Response.make(
                 403,
-                f"leash: {host}:{port} not in allowlist\n",
+                f"leash: {host}:{port} blocked ({reason})\n",
                 {"Content-Type": "text/plain"},
             )
             return
@@ -231,23 +362,19 @@ class AllowlistLogger:
 
     def request(self, flow: http.HTTPFlow) -> None:
         """
-        Intercept plaintext HTTP requests (and already-tunneled HTTPS requests
-        after TLS interception by mitmproxy). Enforces both host:port and
-        path-level rules.
+        Intercept plaintext HTTP and already-tunneled HTTPS requests.
+        Enforces host:port and path-level rules.
         """
         host = flow.request.host
         port = flow.request.port
         client_ip = self._client_ip(flow)
-        allowed, reason = self._is_allowed(
+        action, reason, audit_decision = self._decide(
             host, port, flow.request.method, flow.request.path
         )
         req_body, req_truncated = self._capture_body(flow.request.content or b"")
-        if not allowed:
+        if action == "block":
             self._log(
-                "blocked",
-                host,
-                port,
-                client_ip,
+                "blocked", host, port, client_ip,
                 method=flow.request.method,
                 url=flow.request.pretty_url,
                 reason=reason,
@@ -257,12 +384,13 @@ class AllowlistLogger:
             )
             flow.response = http.Response.make(
                 403,
-                f"leash: {host}:{port}{flow.request.path} blocked\n",
+                f"leash: {host}:{port}{flow.request.path} blocked ({reason})\n",
                 {"Content-Type": "text/plain"},
             )
             return
         flow.metadata["log_allowed"] = True
         flow.metadata["log_client"] = client_ip
+        flow.metadata["log_audit"] = audit_decision
         flow.metadata["log_req_headers"] = self._capture_headers(flow.request.headers)
         flow.metadata["log_req_body"] = req_body
         flow.metadata["log_req_truncated"] = req_truncated
@@ -306,6 +434,7 @@ class AllowlistLogger:
             url=flow.request.pretty_url,
             status=flow.response.status_code if flow.response else 0,
             size=size,
+            audit=flow.metadata.get("log_audit") or "",
             req_headers=flow.metadata.get("log_req_headers"),
             req_body=flow.metadata.get("log_req_body"),
             req_truncated=flow.metadata.get("log_req_truncated", False),
@@ -317,9 +446,7 @@ class AllowlistLogger:
     def error(self, flow: http.HTTPFlow) -> None:
         """
         Log TLS failures, connection resets, and other post-CONNECT errors.
-        These are currently invisible — the CONNECT gets logged as
-        connect_allowed but the subsequent failure is silently dropped.
-        Skip flows we intentionally blocked (already logged as 'blocked').
+        Skip flows intentionally blocked (already logged as 'blocked').
         """
         if not flow.error:
             return

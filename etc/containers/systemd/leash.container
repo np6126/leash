@@ -15,7 +15,7 @@ Volume=/var/lib/leash/mitmproxy:/root/.mitmproxy:Z
 Volume=/var/lib/leash/logs:/logs:Z
 Volume=/etc/leash:/etc/leash:Z
 
-Environment=ALLOWLIST_PATH=/etc/leash/allowlist.yaml
+Environment=LEASH_DIR=/etc/leash
 Environment=LOG_PATH=/logs/egress.jsonl
 Environment=BODY_LIMIT_KB=1024
 

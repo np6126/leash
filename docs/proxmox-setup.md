@@ -91,27 +91,30 @@ SSH into the VM, then clone the repo and run the setup script:
 
 ```bash
 ssh root@<vm-ip>
-git clone <gitrepo>/leash.git
+git clone https://github.com/np6126/leash.git
 cd leash
 sudo ./setup.sh
 ```
 
-**Private allowlist entries (optional):** If you need deployment-specific
-destinations that should not be committed to the repository, create
-`/etc/leash/allowlist.local.yaml` on the VM before running `setup.sh`:
+**Private policy entries (optional):** If you need deployment-specific
+destinations that should not be committed to the repository, drop them into
+`config/*.local.yaml` files next to `setup.sh` before running it:
 
 ```bash
-sudo mkdir -p /etc/leash
-sudo tee /etc/leash/allowlist.local.yaml <<'EOF'
-allowed_destinations:
+cat > /root/leash/config/enforce.local.yaml <<'EOF'
+allow:
   - host: registry.internal.example.com
     ports: [443]
 EOF
+
+cat > /root/leash/config/blocklist.local.yaml <<'EOF'
+block:
+  - pastebin.com
+EOF
 ```
 
-`setup.sh` merges this file into the deployed allowlist automatically on every
-run. The file persists across `git pull && setup.sh` cycles and is never part
-of the repository.
+`setup.sh` merges each base file with its `.local.yaml` counterpart on every
+run, deduplicating by host. The files are git-ignored and never leave the VM.
 
 ## 6. Extract the CA Certificate
 
@@ -121,7 +124,7 @@ After setup, extract the mitmproxy CA certificate and distribute it to all agent
 podman exec leash cat /root/.mitmproxy/mitmproxy-ca-cert.pem > mitmproxy-ca-cert.pem
 ```
 
-With tank-claw-os, inject it as a Podman secret named `proxy_ca_cert`.
+With [tank-agent-os](https://github.com/np6126/tank-agent-os), inject it as a Podman secret named `proxy_ca_cert`.
 
 ## 7. Open the Log Viewer
 
@@ -131,7 +134,7 @@ After setup, the audit log viewer is available at:
 http://<vm-ip>:8090
 ```
 
-It shows all proxy requests with timestamp, client, method, URL, port, status code, and response size — one row per request. Clicking a row expands the request/response headers and body. Features: free-text search, client IP filter, **Internet only** toggle (hides LAN/RFC 1918 traffic), dark/light mode, copy-to-clipboard on body blocks, and a **Clear logs** button. Use **Manage Access** in the detail panel to add or remove allowlist entries without editing YAML.
+It shows all proxy requests with timestamp, client, method, URL, port, status code, and response size — one row per request. Clicking a row expands the request/response headers and body. Features: a `[Enforce | Audit | Blocklist]` mode switcher in the header, free-text search, client IP filter, **Internet only** toggle (hides LAN/RFC 1918 traffic), **Would block in enforce** toggle in non-enforce modes, dark/light mode, copy-to-clipboard on body blocks, and a **Clear logs** button. Use **Manage Access** in the detail panel to add or remove rules in either the enforce list or the blocklist without editing YAML.
 
 ## Firewall
 
@@ -141,10 +144,11 @@ It shows all proxy requests with timestamp, client, method, URL, port, status co
 | 8090 | Log viewer | Management network only — **never from `10.10.10.0/24`** |
 | 22 | SSH | Management network only |
 
-The log viewer's allowlist management endpoints (`/api/allowlist*`) are blocked
-at the application level for any client IP listed under `agent_networks` in
-`/etc/leash/allowlist.yaml`. The default config ships with `10.10.10.0/24`
-there, so agent VMs cannot modify their own restrictions out of the box.
+The log viewer's policy-mutation endpoints (`PUT /api/mode`, `POST /api/policy/*`)
+are blocked at the application level for any client IP listed under
+`agent_networks` in `/etc/leash/agents.yaml`. The default config ships with
+`10.10.10.0/24` there, so agent VMs cannot flip the mode or modify their own
+restrictions out of the box.
 
 For additional hardening, also restrict port 8090 at the network level:
 
@@ -156,6 +160,7 @@ drop      all
 ```
 
 > **Why port 8090 must not be reachable from `10.10.10.0/24`:** An agent that
-> can reach the log viewer could call `/api/allowlist/add` to whitelist any
-> destination for itself. The `agent_networks` key in `allowlist.yaml` is the
-> primary control; a firewall rule is defence in depth.
+> can reach the log viewer could call `PUT /api/mode` to disable enforcement
+> or `POST /api/policy/enforce/add` to whitelist any destination for itself.
+> The `agent_networks` key in `agents.yaml` is the primary control; a firewall
+> rule is defence in depth.
