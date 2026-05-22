@@ -1,6 +1,18 @@
 # Proxmox VE Setup
 
-Steps to create the leash VM on a Proxmox host.
+A step-by-step walkthrough for provisioning the leash VM on a Proxmox host —
+from cloud image to a running proxy with the log viewer reachable. For
+non-Proxmox deployments, see [Deployment](deployment.md).
+
+## Prerequisites
+
+- A Proxmox VE host with two bridges already configured: `vmbr0` (LAN) and
+  `vmbr1` (the isolated agent network). The walkthrough references both but
+  does not create `vmbr1`.
+- A storage pool named `local-lvm` for the VM disk and cloud-init drive (used
+  throughout step 2). Adjust the commands if your pool is named differently.
+- Shell access to the Proxmox host.
+- An SSH keypair to inject into the new VM via cloud-init.
 
 ## 1. Download the Ubuntu 24.04 Cloud Image
 
@@ -43,7 +55,8 @@ qm resize <VMID> scsi0 10G
 
 ## 3. Configure Cloud-Init
 
-Create a vendor cloud-init snippet to install the QEMU guest agent on first boot:
+Create a vendor cloud-init snippet to install the QEMU guest agent and `git`
+(needed in step 5 to clone the repo) on first boot:
 
 ```bash
 mkdir -p /var/lib/vz/snippets
@@ -51,6 +64,7 @@ cat > /var/lib/vz/snippets/leash-vendor.yaml << 'EOF'
 #cloud-config
 packages:
   - qemu-guest-agent
+  - git
 runcmd:
   - systemctl enable --now qemu-guest-agent
 EOF
@@ -130,11 +144,24 @@ With [tank-agent-os](https://github.com/np6126/tank-agent-os), inject it as a Po
 
 After setup, the audit log viewer is available at:
 
-```
+```text
 http://<vm-ip>:8090
 ```
 
-It shows all proxy requests with timestamp, client, method, URL, port, status code, and response size — one row per request. Clicking a row expands the request/response headers and body. Features: a `[Enforce | Audit | Blocklist]` mode switcher in the header, free-text search, client IP filter, **Internet only** toggle (hides LAN/RFC 1918 traffic), **Would block in enforce** toggle in non-enforce modes, dark/light mode, copy-to-clipboard on body blocks, and a **Clear logs** button. Use **Manage Access** in the detail panel to add or remove rules in either the enforce list or the blocklist without editing YAML.
+It shows all proxy requests with timestamp, client, method, URL, port, status
+code, and response size — one row per request. Clicking a row expands the
+request/response headers and body.
+
+Key features:
+
+- `[Enforce | Audit | Blocklist]` mode switcher in the header
+- Free-text search and a client IP filter
+- **Internet only** toggle (hides LAN/RFC 1918 traffic)
+- **Would block in enforce** toggle in non-enforce modes
+- Dark/light mode and copy-to-clipboard on body blocks
+- **Clear logs** button
+- **Manage Access** in the detail panel — add or remove rules in either the
+  enforce list or the blocklist without editing YAML
 
 ## Firewall
 
@@ -152,15 +179,22 @@ restrictions out of the box.
 
 For additional hardening, also restrict port 8090 at the network level:
 
-```
+```text
 allow in  tcp dport 8080 from 10.10.10.0/24  # proxy — agents only
 allow in  tcp dport 8090 from <mgmt-network>  # log viewer — management only
 allow in  tcp dport 22   from <mgmt-network>  # SSH — management only
 drop      all
 ```
 
+> [!WARNING]
 > **Why port 8090 must not be reachable from `10.10.10.0/24`:** An agent that
 > can reach the log viewer could call `PUT /api/mode` to disable enforcement
 > or `POST /api/policy/enforce/add` to whitelist any destination for itself.
 > The `agent_networks` key in `agents.yaml` is the primary control; a firewall
 > rule is defence in depth.
+
+## Next steps
+
+The proxy is now running and enforcing policy. To author allow and block
+rules, see [Policy files](policy.md#policy-files); to understand the three
+modes, see [Modes](policy.md#modes).

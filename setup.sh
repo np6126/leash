@@ -14,7 +14,7 @@ need_root
 
 echo "==> installing packages"
 apt-get update -qq
-apt-get install -y -qq podman git iptables-persistent
+apt-get install -y -qq podman git python3-yaml iptables-persistent
 
 echo "==> enabling IP forwarding for agent network routing"
 WAN_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
