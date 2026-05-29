@@ -39,6 +39,10 @@ class AllowlistLogger:
         self.blocklist_path = os.path.join(LEASH_DIR, "blocklist.yaml")
         self.log_path = os.environ.get("LOG_PATH", "/logs/leash.jsonl")
 
+        # Host whose requests get their real client IP stamped into
+        # X-Agent-Source (see request()). Empty = feature off.
+        self._identity_host = os.environ.get("LEASH_IDENTITY_HOST", "").strip()
+
         self._mode: str = "enforce"
         self._enforce: dict[str, dict] = {}
         self._block: dict[str, dict] = {}
@@ -368,6 +372,13 @@ class AllowlistLogger:
         host = flow.request.host
         port = flow.request.port
         client_ip = self._client_ip(flow)
+        # Stamp the real agent IP for the control plane behind this host.
+        # Rootless-Docker port-publish NATs every agent to one bridge gateway,
+        # collapsing their source IPs into a single identity. This L7 header
+        # survives the L4 NAT; overwrite it so a (prompt-injected) agent can't
+        # forge another's identity.
+        if client_ip and self._identity_host and host == self._identity_host:
+            flow.request.headers["X-Agent-Source"] = client_ip
         action, reason, audit_decision = self._decide(
             host, port, flow.request.method, flow.request.path
         )

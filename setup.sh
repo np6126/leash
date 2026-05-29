@@ -29,6 +29,12 @@ mkdir -p /var/lib/leash/mitmproxy
 mkdir -p /var/lib/leash/logs
 mkdir -p /etc/leash
 
+# leash.container points its EnvironmentFile= here. Quadlet maps that to podman
+# --env-file, which fails if the file is missing, so guarantee it exists. Leave
+# an existing one untouched (cloud-init/operator may have populated it); an empty
+# file just means no extra settings.
+[ -f /etc/leash/identity.env ] || : > /etc/leash/identity.env
+
 # ── One-shot migration: legacy /etc/leash/allowlist*.yaml → new layout ───────
 # Detect the old single-file deployment and split it into mode + agents.yaml +
 # enforce.yaml. The legacy local override (deployed by the old
