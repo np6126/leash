@@ -65,10 +65,22 @@ cat > /var/lib/vz/snippets/leash-vendor.yaml << 'EOF'
 packages:
   - qemu-guest-agent
   - git
+write_files:
+  # Optional: control-plane host whose agent traffic gets its real source IP
+  # stamped into the X-Agent-Source header (the host behind a NAT that would
+  # otherwise collapse every agent to one client IP). Set to your own host;
+  # omit this file entirely to leave the feature off.
+  - path: /etc/leash/identity.env
+    content: |
+      LEASH_IDENTITY_HOST=beacon.example.com
 runcmd:
   - systemctl enable --now qemu-guest-agent
 EOF
 ```
+
+`identity.env` is read by the leash container (`EnvironmentFile=` in
+`leash.container`). Set `LEASH_IDENTITY_HOST` to the host this leash instance
+fronts, or omit the file to leave source-IP stamping off.
 
 Then configure the VM. In the Proxmox UI, select the VM → **Cloud-Init** tab:
 

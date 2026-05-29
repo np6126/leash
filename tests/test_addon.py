@@ -594,6 +594,45 @@ class TestHookPipeline:
         assert self._entries() == []
 
 
+class TestAgentSourceInjection:
+    """request() stamps X-Agent-Source with the real client IP for the
+    configured identity host only, overwriting any client-supplied value."""
+
+    IDENTITY_HOST = "identity.example.test"
+
+    def setup_method(self):
+        self.addon = _make_addon()
+        self.addon._identity_host = self.IDENTITY_HOST
+        # audit mode never logs from request() (only block/response paths do),
+        # so no log file is needed — injection happens before the policy check.
+        self.addon._mode = "audit"
+
+    def _run(self, host, client_ip, headers):
+        flow = _make_request_flow(host, 443, "POST", "/api/agent/get_task", client_ip)
+        flow.request.headers = headers
+        with patch.object(self.addon, "_reload_if_changed"):
+            self.addon.request(flow)
+        return flow
+
+    def test_injects_for_identity_host(self):
+        flow = self._run(self.IDENTITY_HOST, "10.10.10.2", {})
+        assert flow.request.headers.get("X-Agent-Source") == "10.10.10.2"
+
+    def test_no_injection_for_other_host(self):
+        flow = self._run("api.example.com", "10.10.10.2", {})
+        assert "X-Agent-Source" not in flow.request.headers
+
+    def test_overwrites_client_supplied_value(self):
+        # A prompt-injected agent claiming to be .99 — leash overwrites with truth.
+        flow = self._run(self.IDENTITY_HOST, "10.10.10.3", {"X-Agent-Source": "10.10.10.99"})
+        assert flow.request.headers.get("X-Agent-Source") == "10.10.10.3"
+
+    def test_no_injection_when_identity_host_unset(self):
+        self.addon._identity_host = ""
+        flow = self._run(self.IDENTITY_HOST, "10.10.10.2", {})
+        assert "X-Agent-Source" not in flow.request.headers
+
+
 class TestLogRotationRobustness:
     """The persistent _log_fh must survive external file replacement
     (logrotate, manual rm, logviewer clear-logs creating a new inode)."""

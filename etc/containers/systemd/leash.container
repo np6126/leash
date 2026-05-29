@@ -19,6 +19,13 @@ Environment=LEASH_DIR=/etc/leash
 Environment=LOG_PATH=/logs/egress.jsonl
 Environment=BODY_LIMIT_KB=1024
 
+# Per-VM settings, e.g. LEASH_IDENTITY_HOST — the control-plane host whose agent
+# traffic gets its real source IP stamped into X-Agent-Source (see
+# docs/proxmox-setup.md). Quadlet maps this to podman --env-file, which needs an
+# absolute path and an existing file; setup.sh creates an empty one if unset, so
+# an empty file just leaves the settings unset.
+EnvironmentFile=/etc/leash/identity.env
+
 PodmanArgs=--memory 256m
 
 [Service]
