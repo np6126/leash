@@ -70,6 +70,13 @@
     </svg>
     <input type="text" id="client" placeholder="Filter by client IP" oninput="onFilter()">
   </div>
+  <div class="input-wrap">
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2"/><line x1="2" y1="2" x2="14" y2="14"/>
+    </svg>
+    <input type="text" id="exclude-host" placeholder="Hide host (Enter)"
+           title="Hide all requests to this host — e.g. a service an agent pings every few seconds" onkeydown="onExcludeHostKey(event)">
+  </div>
   <button class="toggle-btn" id="internet-toggle" onclick="toggleInternetOnly()" title="Hides requests to private IPs (RFC 1918)">
     <span class="toggle-dot"></span>
     Internet only
@@ -83,6 +90,8 @@
   <span id="fetch-error" class="fetch-error" style="display:none" title="Log server unreachable — retrying…">⚠ disconnected</span>
   <span class="filter-count" id="filter-count"></span>
 </div>
+
+<div id="host-pills" class="host-pills" hidden></div>
 
 <div class="table-outer">
   <table>

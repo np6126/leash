@@ -112,6 +112,57 @@ function toggleWouldBlock() {
   fetchLogs(true);
 }
 
+// ── Hidden hosts ───────────────────────────────────────────────────────────────
+// Excluded server-side so noisy hosts (e.g. a service an agent pings every 5s)
+// don't eat into the newest-N row budget the log server returns.
+
+let excludedHosts = [];
+try {
+  const stored = JSON.parse(localStorage.getItem('leash-excluded-hosts') || '[]');
+  if (Array.isArray(stored)) excludedHosts = stored.filter(h => typeof h === 'string');
+} catch (_) {}
+
+function _saveExcludedHosts() {
+  localStorage.setItem('leash-excluded-hosts', JSON.stringify(excludedHosts));
+}
+
+function renderHostPills() {
+  const bar = document.getElementById('host-pills');
+  if (!excludedHosts.length) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  bar.hidden = false;
+  bar.innerHTML = '<span class="host-pills-label">Hidden hosts</span>' +
+    excludedHosts.map((h, i) =>
+      `<span class="host-pill"><span class="host-pill-name" title="${esc(h)}">${esc(h)}</span>` +
+      `<button class="host-pill-x" onclick="removeExcludedHost(${i})" aria-label="Show ${esc(h)} again" title="Remove filter — show ${esc(h)} again">✕</button></span>`
+    ).join('');
+}
+
+function addExcludedHost(host) {
+  host = (host || '').trim().toLowerCase();
+  if (!host || excludedHosts.includes(host)) return;
+  excludedHosts.push(host);
+  _saveExcludedHosts();
+  renderHostPills();
+  fetchLogs(true);
+}
+
+function removeExcludedHost(i) {
+  excludedHosts.splice(i, 1);
+  _saveExcludedHosts();
+  renderHostPills();
+  fetchLogs(true);
+}
+
+function onExcludeHostKey(e) {
+  if (e.key !== 'Enter') return;
+  addExcludedHost(e.target.value);
+  e.target.value = '';
+}
+
 // ── Row state ─────────────────────────────────────────────────────────────────
 
 let nextId        = 0;
@@ -501,6 +552,7 @@ async function fetchLogs(full = false) {
   const errEl   = document.getElementById('fetch-error');
   const params  = new URLSearchParams({ q, client, limit: 500 });
   if (internetOnly) params.set('internet_only', '1');
+  if (excludedHosts.length) params.set('exclude_hosts', excludedHosts.join(','));
   if (full && spinner) spinner.style.opacity = '1';
   try {
     const res  = await fetch('/api/logs?' + params);
@@ -876,6 +928,7 @@ document.addEventListener('keydown', e => {
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 
+renderHostPills();
 fetchLogs(true);
 fetchMeta();
 fetchMode();

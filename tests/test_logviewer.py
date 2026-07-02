@@ -142,6 +142,31 @@ class TestReadLogs:
         result = list(srv._iter_logs("", "", 500, internet_only=True))
         assert len(result) == 1 and result[0]["host"] == "api.example.com"
 
+    def test_exclude_hosts(self, tmp_path, monkeypatch):
+        path = _write_log(tmp_path, [
+            {"ts": 1.0, "event": "allowed", "host": "noisy.example.com", "client": "10.0.0.1"},
+            {"ts": 2.0, "event": "allowed", "host": "api.example.com",   "client": "10.0.0.1"},
+        ])
+        monkeypatch.setattr(srv, "LOG_PATH", path)
+        result = list(srv._iter_logs("", "", 500, exclude_hosts={"noisy.example.com"}))
+        assert len(result) == 1 and result[0]["host"] == "api.example.com"
+
+    def test_exclude_hosts_case_insensitive(self, tmp_path, monkeypatch):
+        path = _write_log(tmp_path, [
+            {"ts": 1.0, "event": "allowed", "host": "Noisy.Example.com", "client": "10.0.0.1"},
+        ])
+        monkeypatch.setattr(srv, "LOG_PATH", path)
+        assert list(srv._iter_logs("", "", 500, exclude_hosts={"noisy.example.com"})) == []
+
+    def test_exclude_hosts_keeps_mode_change(self, tmp_path, monkeypatch):
+        path = _write_log(tmp_path, [
+            {"ts": 1.0, "event": "mode_change", "previous": "enforce", "mode": "audit"},
+            {"ts": 2.0, "event": "allowed", "host": "noisy.example.com", "client": "10.0.0.1"},
+        ])
+        monkeypatch.setattr(srv, "LOG_PATH", path)
+        result = list(srv._iter_logs("", "", 500, exclude_hosts={"noisy.example.com"}))
+        assert len(result) == 1 and result[0]["event"] == "mode_change"
+
     def test_limit_respected(self, tmp_path, monkeypatch):
         records = [
             {"ts": float(i), "event": "allowed", "host": "a.com", "client": "10.0.0.1"}
