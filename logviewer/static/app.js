@@ -113,8 +113,9 @@ function toggleWouldBlock() {
 }
 
 // ── Hidden hosts ───────────────────────────────────────────────────────────────
-// Excluded server-side so noisy hosts (e.g. a service an agent pings every 5s)
-// don't eat into the newest-N row budget the log server returns.
+// Filtered client-side only: the server keeps returning every row (client filters
+// must never change what the log endpoint serves), so hidden hosts still count
+// toward the newest-N the server sends. Persisted per-browser via localStorage.
 
 let excludedHosts = [];
 try {
@@ -179,9 +180,12 @@ let sortKey = null;
 let sortDir = -1;
 
 function _displayIds() {
-  const ids = wouldBlockOnly
+  let ids = wouldBlockOnly
     ? currentIds.filter(id => rowById[id].audit === 'would_block_in_enforce')
     : currentIds;
+  if (excludedHosts.length) {
+    ids = ids.filter(id => !excludedHosts.includes((rowById[id].host || '').toLowerCase()));
+  }
   if (!sortKey) return ids;
   return [...ids].sort((a, b) => {
     const va = rowById[a][sortKey];
@@ -258,22 +262,23 @@ function render(rows) {
 
   _resetRows();
 
-  if (!rows.length) {
+  if (rows.length) {
+    topTs = rows[0].ts;
+    for (const r of rows) {
+      const id = nextId++;
+      rowById[id] = r;
+      currentIds.push(id);
+    }
+  }
+
+  const ids = _displayIds();
+  if (!ids.length) {
     tbody.innerHTML = '';
     empty.style.display = 'block';
     countEl.textContent = '0 entries';
     return;
   }
   empty.style.display = 'none';
-  topTs = rows[0].ts;
-
-  for (const r of rows) {
-    const id = nextId++;
-    rowById[id] = r;
-    currentIds.push(id);
-  }
-
-  const ids = _displayIds();
   countEl.textContent = ids.length + (rows.length >= 500 ? '+' : '') + ' entries';
   tbody.innerHTML = ids.map(id => buildRowHtml(id)).join('');
   _updateSortHeaders();
@@ -311,7 +316,7 @@ function prependRows(newRows) {
   topTs = rowById[newIds[0]].ts;
 
   document.getElementById('empty').style.display = 'none';
-  if (sortKey || wouldBlockOnly) {
+  if (sortKey || wouldBlockOnly || excludedHosts.length) {
     _rebuildTbody();
   } else {
     tbody.insertAdjacentHTML('afterbegin', newIds.map(id => buildRowHtml(id)).join(''));
@@ -552,7 +557,6 @@ async function fetchLogs(full = false) {
   const errEl   = document.getElementById('fetch-error');
   const params  = new URLSearchParams({ q, client, limit: 500 });
   if (internetOnly) params.set('internet_only', '1');
-  if (excludedHosts.length) params.set('exclude_hosts', excludedHosts.join(','));
   if (full && spinner) spinner.style.opacity = '1';
   try {
     const res  = await fetch('/api/logs?' + params);

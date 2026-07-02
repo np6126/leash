@@ -114,17 +114,12 @@ class Handler(BaseHTTPRequestHandler):
             client_f = (qs.get("client", [""])[0] or "").strip().lower()
             limit = min(int(qs.get("limit", ["500"])[0]), 2000)
             internet_only = qs.get("internet_only", [""])[0] == "1"
-            exclude_hosts = {
-                h.strip().lower()
-                for h in (qs.get("exclude_hosts", [""])[0] or "").split(",")
-                if h.strip()
-            }
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b"[")
             sep = b""
-            for record in _iter_logs(q, client_f, limit, internet_only, exclude_hosts):
+            for record in _iter_logs(q, client_f, limit, internet_only):
                 self.wfile.write(sep + json.dumps(record).encode())
                 sep = b","
             self.wfile.write(b"]")
@@ -532,10 +527,8 @@ def _count_lines() -> int:
         return 0
 
 
-def _record_matches(record: dict, q: str, client_f: str, internet_only: bool, exclude_hosts=None) -> bool:
+def _record_matches(record: dict, q: str, client_f: str, internet_only: bool) -> bool:
     if record.get("event") == "connect_allowed":
-        return False
-    if exclude_hosts and (record.get("host") or "").lower() in exclude_hosts:
         return False
     if internet_only and _is_lan(record.get("host") or record.get("url") or ""):
         return False
@@ -547,7 +540,7 @@ def _record_matches(record: dict, q: str, client_f: str, internet_only: bool, ex
     return True
 
 
-def _iter_logs(q: str, client_f: str, limit: int, internet_only: bool = False, exclude_hosts=None):
+def _iter_logs(q: str, client_f: str, limit: int, internet_only: bool = False):
     try:
         f = open(LOG_PATH, "rb")
     except OSError:
@@ -570,7 +563,7 @@ def _iter_logs(q: str, client_f: str, limit: int, internet_only: bool = False, e
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not _record_matches(record, q, client_f, internet_only, exclude_hosts):
+                if not _record_matches(record, q, client_f, internet_only):
                     continue
                 yield record
                 yielded += 1
